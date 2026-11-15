@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Setzt für alle ausführbaren Werkzeuge in diesem Ordner einen Verweis in ~/bin.
+# Echte Dateien gleichen Namens in ~/bin werden nicht überschrieben.
+cd "$(dirname "$0")" || exit 1
+mkdir -p "$HOME/bin"
+for f in *; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    [ "$f" = einrichten ] && continue
+    ziel="$HOME/bin/$f"
+    if [ -L "$ziel" ] || [ ! -e "$ziel" ]; then
+        ln -sfn "$PWD/$f" "$ziel"
+        echo "Verknüpft: $f"
+    else
+        echo "Übersprungen, in ~/bin liegt schon eine echte Datei: $f"
+    fi
+done

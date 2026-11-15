@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Wandelt alle CR2-Rohdateien im aktuellen Ordner mit darktable-cli in JPEG um.
+# Vorhandene JPEGs werden nicht überschrieben.
+gefunden=0
+for pic in *.CR2 *.cr2; do
+    [ -e "$pic" ] || continue
+    gefunden=1
+    ziel="${pic%.*}.jpg"
+    if [ -e "$ziel" ]; then
+        echo "Übersprungen, gibt es schon: $ziel"
+        continue
+    fi
+    darktable-cli "$pic" "$ziel"
+done
+[ "$gefunden" -eq 1 ] || echo "Keine CR2-Dateien im aktuellen Ordner."
