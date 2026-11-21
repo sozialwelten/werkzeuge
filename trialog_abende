@@ -3,16 +3,22 @@
 
 Ordnet jedem Abend die Dateien zu, die zu ihm gehören: Fotos aus dem
 Bestandskatalog von `bestand` (Aufnahmezeit zwischen 12 Uhr am Abend und
-6 Uhr am Morgen danach), die Abendordner und die gescannten Blätter aus
-dem Scankatalog.
+6 Uhr am Morgen danach), die Abendordner, die gescannten Blätter aus dem
+Scankatalog und den Beitrag auf zeithueter.de mit Nummer und Bildtitel.
 
-Abende kommen aus Ordnern, deren Name ein Datum der Form JJMMTT trägt,
-mit oder ohne vorangestelltes ∆, ∆1, ∆C oder ∆Ort und mit oder ohne
-Zyklus, etwa ∆1_090624_1.1, ∆_090708, 121017_1.23 oder ∆C_170929_0.01.
-Dazu kommen Markdown-Tabellen mit einer Spalte „Datum“ (TT.MM.JJJJ) und
-wahlweise einer Spalte mit der Kennung. Abende werden über das Datum
-zusammengeführt; zwei Abende am selben Tag bleiben getrennt, wenn ihr
-Zyklus verschieden ist.
+Abende kommen aus vier Quellen:
+- Markdown-Tabellen mit einer Spalte „Datum“ (TT.MM.JJJJ) und wahlweise
+  einer Spalte mit der Kennung (--liste),
+- Ordnernamen mit einem Datum JJMMTT, mit oder ohne vorangestelltes ∆, ∆1,
+  ∆C oder ∆Ort und mit oder ohne Zyklus, etwa ∆1_090624_1.1, ∆_090708,
+  121017_1.23 oder ∆C_170929_0.01,
+- Beiträgen einer WordPress-Sicherung als JSON (--website), deren Titel
+  oder Adresse eine Kennung oder ein Datum trägt.
+
+Abende werden über Datum und Zyklus zusammengeführt. Was nur aus Ordnern
+oder von der Website stammt, wird einem Nachbarn zugeschlagen, wenn derselbe
+Zyklus innerhalb von drei Wochen schon vorkommt. Widersprüche stehen im
+Bericht unter „Zu prüfen“.
 
 Der Bericht enthält nur Struktur und öffentliche Titel, keine Inhalte der
 Blätter. Wahlweise entsteht eine CSV mit allen zugeordneten Dateien.
@@ -21,19 +27,24 @@ Lizenz: GPL-3.0-or-later
 """
 import argparse
 import csv
+import glob
+import html
+import json
 import re
 import sqlite3
 import sys
+import urllib.parse
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
-KENNUNG = re.compile(r"∆(?:1|[A-Za-z]+)?_?(\d{6})(?:_(\d+\.\d+))?")
+KENNUNG = re.compile(r"(∆(?:1|2|3|[A-Za-z]+)?)_?(\d{6})(?:_(\d+\.\d+))?")
 ORDNER = re.compile(r"(?:∆(?:1|[A-Za-z]+)?_?)?(\d{6})(?:_(\d+[.-]\d+))?(?:_.+)?")
 DATUM = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
-NUMMER = re.compile(r"#(\d+)")
+NUMMER = re.compile(r"#\s?(\d{1,3})\b")
 WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 FRUEHESTENS, SPAETESTENS = date(2009, 1, 1), date(2021, 12, 31)
+RANG = {"Liste": 9, "Website": 5}
 
 
 def jjmmtt(s):
@@ -54,30 +65,47 @@ def daten_im_text(text):
     return out
 
 
+def serie_von(kennung):
+    m = KENNUNG.search(kennung or "")
+    return m.group(1).lower() if m and m.group(1) not in ("∆",) else None
+
+
 class Abende:
     def __init__(self):
         self.liste = []
 
-    def finden(self, d, zyklus):
+    def finden(self, d, zyklus, serie):
         for a in self.liste:
-            if a["datum"] == d and (not zyklus or not a["zyklus"] or a["zyklus"] == zyklus):
-                return a
+            if a["datum"] != d:
+                continue
+            if zyklus and a["zyklus"] and a["zyklus"] != zyklus:
+                continue
+            if serie and a["serie"] and a["serie"] != serie:
+                continue
+            return a
         return None
 
-    def add(self, d, zyklus=None, kennung="", titel="", ort="", quelle="", weitere=None):
-        a = self.finden(d, zyklus)
+    def add(self, d, zyklus=None, kennung="", titel="", ort="", quelle="", weitere=None, **extra):
+        serie = serie_von(kennung)
+        a = self.finden(d, zyklus, serie)
         if a is None:
-            a = {"datum": d, "zyklus": zyklus, "kennung": "", "rang": -1, "titel": titel, "ort": ort,
-                 "quellen": set(), "hinweise": [], "weitere": set()}
+            a = {"datum": d, "zyklus": zyklus, "serie": serie, "kennung": "", "rang": -1, "titel": "",
+                 "ort": "", "nr": None, "web_nr": None, "link": "", "quellen": set(), "hinweise": [],
+                 "weitere": set()}
             self.liste.append(a)
         a["zyklus"] = a["zyklus"] or zyklus
-        rang = 9 if quelle == "Liste" else (1 if zyklus else 0) + (1 if kennung.startswith("∆") else 0) + (1 if kennung.startswith("∆1_") else 0)
+        a["serie"] = a["serie"] or serie
+        rang = RANG.get(quelle, 0) + (1 if zyklus else 0) + (1 if kennung.startswith("∆") else 0) \
+            + (1 if kennung.startswith("∆1_") else 0)
         if kennung and rang > a["rang"]:
             a["kennung"], a["rang"] = kennung, rang
         if weitere:
             a["weitere"].add(weitere)
         a["titel"] = a["titel"] or titel
         a["ort"] = a["ort"] or ort
+        for k, v in extra.items():
+            if v and not a.get(k):
+                a[k] = v
         if quelle:
             a["quellen"].add(quelle)
         return a
@@ -102,59 +130,148 @@ def liste_lesen(pfad, abende):
             continue
         d = daten[0]
         m = KENNUNG.search(zeile)
-        kd = jjmmtt(m.group(1)) if m else None
+        kd = jjmmtt(m.group(2)) if m else None
         kennung = m.group(0) if m else werte.get("kalender", "")
-        a = abende.add(d, m.group(2) if m else None, kennung, werte.get("titel", ""),
-                       werte.get("ort", ""), "Liste", weitere=kd if kd and kd != d else None)
+        titel = werte.get("titel", "")
+        n = NUMMER.search(titel)
+        a = abende.add(d, m.group(3) if m else None, kennung, titel, werte.get("ort", ""), "Liste",
+                       weitere=kd if kd and kd != d else None, nr=int(n.group(1)) if n else None)
         if kd and kd != d:
             a["hinweise"].append(f"Datum {d:%d.%m.%Y} in der Liste, Kennung sagt {kd:%d.%m.%Y}; Fotos werden an beiden Tagen gesucht")
 
 
+def text_ohne_tags(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def website_lesen(ordner, abende):
+    ordner = Path(ordner)
+    kat = {}
+    for f in ordner.glob("categories_*.json"):
+        for c in json.load(open(f, encoding="utf-8")):
+            kat[c["id"]] = html.unescape(c["name"])
+    posts = [p for f in sorted(ordner.glob("posts_*.json")) for p in json.load(open(f, encoding="utf-8"))]
+    gezaehlt = 0
+    for p in sorted(posts, key=lambda p: p["date"]):
+        titel = text_ohne_tags(p["title"]["rendered"])
+        if re.match(r"(?i)schabb", titel):
+            continue
+        slug = urllib.parse.unquote(p["slug"])
+        slug_punkt = re.sub(r"(\d)-(\d)", r"\1.\2", slug)
+        pub = date.fromisoformat(p["date"][:10])
+        kats = [kat.get(i, "") for i in p.get("categories", [])]
+        orte = [k.replace("∆ Trialog ", "") for k in kats if k.startswith("∆ Trialog ")]
+        zeilen = [text_ohne_tags(z) for z in re.split(r"<br\s*/?>|</p>|\n", p["content"]["rendered"])]
+        nummern = []
+        for z in zeilen:
+            m = re.match(r"#\s?(\d{1,3})\b\s*(.*)", z)
+            if m:
+                nummern.append((int(m.group(1)), m.group(2).strip()))
+
+        funde = [(m, "Titel") for m in KENNUNG.finditer(titel)]
+        slug_funde = list(KENNUNG.finditer(slug_punkt))
+        titel_daten = daten_im_text(titel)
+        eintraege = []
+        if not funde and titel_daten and 0 <= (pub - titel_daten[0]).days <= 21:
+            d = titel_daten[0]
+            sd = jjmmtt(slug_funde[0].group(2)) if slug_funde else None
+            zyklus = slug_funde[0].group(3) if slug_funde and sd == d else None
+            hinweis = (f"Website: Titel nennt {d:%d.%m.%Y}, Adresse {slug_funde[0].group(0)}"
+                       if slug_funde and sd != d else None)
+            eintraege.append((d, zyklus, slug_funde[0].group(0).replace("-", ".") if zyklus else "", hinweis))
+            funde = []
+        elif not funde:
+            funde = [(m, "Adresse") for m in slug_funde]
+        for i, (m, woher) in enumerate(funde):
+            d = jjmmtt(m.group(2))
+            hinweis = None
+            if d is None or not 0 <= (pub - d).days <= 21:
+                alt = jjmmtt(slug_funde[i].group(2)) if i < len(slug_funde) else None
+                if alt and 0 <= (pub - alt).days <= 21:
+                    hinweis = f"Website: {woher} nennt {m.group(0)}, Adresse {slug_funde[i].group(0)}"
+                    d = alt
+                elif d:
+                    try:
+                        neu = d.replace(year=pub.year)
+                    except ValueError:
+                        neu = None
+                    if neu and 0 <= (pub - neu).days <= 21:
+                        hinweis = f"Website: Kennung {m.group(0)} mit falschem Jahr, veröffentlicht {pub:%d.%m.%Y}"
+                        d = neu
+                    else:
+                        hinweis = f"Website: Kennung {m.group(0)}, aber veröffentlicht {pub:%d.%m.%Y}"
+            if d:
+                eintraege.append((d, m.group(3), m.group(0).replace("-", "."), hinweis))
+        if not eintraege:
+            continue
+        gezaehlt += 1
+        for i, (d, zyklus, kennung, hinweis) in enumerate(eintraege):
+            nr, bild = nummern[i] if i < len(nummern) else (None, "")
+            titel_aus = f"#{nr} {bild}".strip() if nr else ""
+            a = abende.add(d, zyklus, kennung, titel_aus, orte[0] if len(orte) == 1 else "", "Website",
+                           link=p["link"], web_nr=nr)
+            if hinweis:
+                a["hinweise"].append(hinweis)
+    return gezaehlt
+
+
 def zusammenfuehren(abende, ordner_von, fotozahl):
-    """Schlägt Abende, die nur aus Ordnernamen stammen, einem Nachbarn zu:
-    am selben Tag, mit gleichem Zyklus in derselben Woche, oder ohne Zyklus
-    und ohne eigene Fotos am Tag nach einem Abend."""
-    def nur_ordner(x):
-        return x["quellen"] == {"Ordner"}
+    """Schlägt Abende, die nicht aus der Liste stammen, einem Nachbarn zu:
+    mit gleichem Zyklus innerhalb von drei Wochen, aus Ordnern auch am selben
+    Tag oder ohne Zyklus und ohne eigene Fotos am Tag nach einem Abend."""
+    def ohne_liste(x):
+        return "Liste" not in x["quellen"]
 
     def gewicht(x):
-        return ("Liste" in x["quellen"], fotozahl(x["datum"]), x["datum"].weekday() == 2, x["rang"])
+        return ("Liste" in x["quellen"], "Website" in x["quellen"], fotozahl(x["datum"]),
+                x["datum"].weekday() == 2, x["rang"])
+
+    def gleiche_serie(a, b):
+        return not a["serie"] or not b["serie"] or a["serie"] == b["serie"]
 
     geaendert = True
     while geaendert:
         geaendert = False
         for src in list(abende.liste):
-            if not nur_ordner(src):
+            if not ohne_liste(src):
                 continue
-            kandidaten = []
+            nur_ordner = src["quellen"] == {"Ordner"}
+            zyklus_gleich, tag_gleich, tag_danach = [], [], []
             for dst in abende.liste:
-                if dst is src:
+                if dst is src or not gleiche_serie(src, dst):
                     continue
                 abstand = (src["datum"] - dst["datum"]).days
-                if abstand == 0:
-                    kandidaten.append(dst)
-                elif src["zyklus"] and src["zyklus"] == dst["zyklus"] and abs(abstand) <= 7:
-                    kandidaten.append(dst)
-                elif not src["zyklus"] and abstand == 1 and fotozahl(src["datum"]) == 0:
-                    kandidaten.append(dst)
+                if src["zyklus"] and src["zyklus"] == dst["zyklus"] and abs(abstand) <= 21:
+                    zyklus_gleich.append(dst)
+                elif nur_ordner and abstand == 0:
+                    tag_gleich.append(dst)
+                elif nur_ordner and not src["zyklus"] and abstand == 1 and fotozahl(src["datum"]) == 0:
+                    tag_danach.append(dst)
+            kandidaten = zyklus_gleich or tag_gleich or tag_danach
             if not kandidaten:
                 continue
             dst = max(kandidaten, key=gewicht)
-            if not nur_ordner(dst) or gewicht(dst) >= gewicht(src):
-                for k, v in ordner_von.items():
-                    if v is src:
-                        ordner_von[k] = dst
-                dst["quellen"] |= src["quellen"]
-                dst["zyklus"] = dst["zyklus"] or src["zyklus"]
-                if src["rang"] > dst["rang"]:
-                    dst["kennung"], dst["rang"] = src["kennung"], src["rang"]
-                if src["datum"] == dst["datum"]:
-                    dst["hinweise"].append(f"Ordner {src['kennung']} am selben Tag mit anderem Zyklus, zugeschlagen")
-                else:
-                    dst["hinweise"].append(f"Ordner {src['kennung']} trägt das Datum {src['datum']:%d.%m.%Y}, zugeschlagen")
-                abende.liste.remove(src)
-                geaendert = True
-                break
+            if gewicht(dst) < gewicht(src):
+                continue
+            for k, v in ordner_von.items():
+                if v is src:
+                    ordner_von[k] = dst
+            dst["quellen"] |= src["quellen"]
+            dst["zyklus"] = dst["zyklus"] or src["zyklus"]
+            dst["weitere"] |= src["weitere"]
+            for k in ("titel", "ort", "link", "nr", "web_nr"):
+                dst[k] = dst[k] or src[k]
+            if src["rang"] > dst["rang"]:
+                dst["kennung"], dst["rang"] = src["kennung"], src["rang"]
+            herkunft = "Website-Beitrag" if "Website" in src["quellen"] else "Ordner"
+            if src["datum"] == dst["datum"]:
+                dst["hinweise"].append(f"{herkunft} {src['kennung']} am selben Tag mit anderem Zyklus, zugeschlagen")
+            else:
+                dst["hinweise"].append(f"{herkunft} {src['kennung'] or ''} trägt das Datum {src['datum']:%d.%m.%Y}, zugeschlagen".replace("  ", " "))
+            dst["hinweise"].extend(src["hinweise"])
+            abende.liste.remove(src)
+            geaendert = True
+            break
 
 
 def zeit(aufnahme):
@@ -165,10 +282,11 @@ def zeit(aufnahme):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Katalog je Trialog-Abend aus Bestand und Scankatalog")
+    ap = argparse.ArgumentParser(description="Katalog je Trialog-Abend aus Bestand, Scankatalog, Liste und Website")
     ap.add_argument("--db", required=True, help="Bestandskatalog von bestand (SQLite)")
     ap.add_argument("--katalog", help="Scankatalog als CSV mit den Spalten datei_id, kennung, datum_blatt, datum_erschlossen, dokumentart")
     ap.add_argument("--liste", action="append", default=[], help="Markdown-Datei mit einer Tabelle der Abende, mehrfach möglich")
+    ap.add_argument("--website", help="Ordner mit einer WordPress-Sicherung (posts_*.json, categories_*.json)")
     ap.add_argument("--aus", required=True, help="Bericht als Markdown")
     ap.add_argument("--dateien", help="CSV mit allen zugeordneten Dateien")
     ap.add_argument("--ohne-kamera", action="append", default=["oj_g510n"],
@@ -180,9 +298,9 @@ def main():
     zeilen = con.execute("SELECT pfad, endung, sha256, aufnahme, kamera FROM datei").fetchall()
     abende = Abende()
 
-    # Abende aus der Liste zuerst, dann aus den Ordnern
     for liste in a.liste:
         liste_lesen(liste, abende)
+    n_web = website_lesen(a.website, abende) if a.website else 0
     ordner_von = {}
     for pfad, *_ in zeilen:
         teile = PurePosixPath(pfad).parts[:-1]
@@ -215,7 +333,6 @@ def main():
     zusammenfuehren(abende, ordner_von, lambda d: len({f[2] for f in im_fenster(d)}))
     abende.liste.sort(key=lambda x: (x["datum"], x["zyklus"] or ""))
 
-    # Abendordner: jede Datei unter dem ersten Ordner mit Datum
     ordner = defaultdict(list)
     for p, e, s, t, c in zeilen:
         teile = PurePosixPath(p).parts[:-1]
@@ -225,7 +342,6 @@ def main():
                 ordner[id(ab)].append((p, e))
                 break
 
-    # Fotos je Abend
     zuordnung = defaultdict(list)
     belegte = set()
     for ab in abende.liste:
@@ -235,7 +351,6 @@ def main():
                     belegte.add(f[2])
                     zuordnung[id(ab)].append(f)
 
-    # Scans
     scans = defaultdict(list)
     if a.katalog:
         for z in csv.DictReader(open(a.katalog, encoding="utf-8")):
@@ -243,29 +358,45 @@ def main():
             unsicher = bool(re.search(r"oder|vermut|\?", z.get("datum_erschlossen") or "", re.I))
             zk = (z.get("kennung") or "").strip()
             m = KENNUNG.search(zk)
-            zk = m.group(2) if m else zk
+            zk = m.group(3) if m else zk
             for ab in abende.liste:
                 if ab["datum"] in daten or (not daten and zk and zk == ab["zyklus"]):
                     scans[id(ab)].append((z.get("datei_id", ""), z.get("dokumentart", ""), unsicher))
 
-    # Hinweise zur Liste: Nummern in der Reihenfolge der Daten
+    # Nummern: Reihenfolge, Doppelungen, Abweichung Liste und Website
+    for ab in abende.liste:
+        ab["nr"] = ab["nr"] or ab["web_nr"]
+        if ab["nr"] and ab["web_nr"] and ab["nr"] != ab["web_nr"]:
+            ab["hinweise"].append(f"Nummer #{ab['nr']}, auf der Website #{ab['web_nr']}")
+    # Doppelt vergeben: dieselbe Website-Nummer innerhalb eines Jahres
+    nach_nr = defaultdict(list)
+    for ab in abende.liste:
+        if ab["web_nr"]:
+            nach_nr[ab["web_nr"]].append(ab)
+    for n, gruppe in nach_nr.items():
+        for ab in gruppe:
+            andere = [x for x in gruppe if x is not ab and abs((x["datum"] - ab["datum"]).days) < 365]
+            if andere:
+                ab["hinweise"].append(f"#{n} ist auf der Website auch am {andere[0]['datum']:%d.%m.%Y} vergeben")
+    # Reihenfolge: kleine Rücksprünge melden, große gelten als eigene Zählung (etwa Berlin 2013)
     letzte = None
     for ab in abende.liste:
-        m = NUMMER.search(ab["titel"])
-        if m and "Liste" in ab["quellen"]:
-            n = int(m.group(1))
-            if letzte and n < letzte[0]:
-                ab["hinweise"].append(f"#{n} liegt zeitlich nach #{letzte[0]} vom {letzte[1]:%d.%m.%Y}, Nummer und Datum passen nicht zusammen")
-            letzte = (n, ab["datum"])
+        if ab["nr"]:
+            if letzte and ab["nr"] < letzte[0]:
+                if letzte[0] - ab["nr"] <= 30:
+                    ab["hinweise"].append(f"#{ab['nr']} liegt zeitlich nach #{letzte[0]} vom {letzte[1]:%d.%m.%Y}, Nummer und Datum passen nicht zusammen")
+                continue
+            letzte = (ab["nr"], ab["datum"])
 
-    # Bericht
     n_liste = sum(1 for ab in abende.liste if "Liste" in ab["quellen"])
+    n_website = sum(1 for ab in abende.liste if "Website" in ab["quellen"])
     aus = [f"Stand: {date.today():%d.%m.%Y}. Katalog von {len(abende.liste)} Trialog-Abenden, "
-           f"{n_liste} davon aus der Liste, ermittelt aus {len(zeilen)} Dateien im Bestand"
-           + (" und dem Scankatalog." if a.katalog else "."), ""]
+           f"{n_liste} davon aus der Liste und {n_website} mit Beitrag auf der Website, ermittelt aus "
+           f"{len(zeilen)} Dateien im Bestand" + (", dem Scankatalog" if a.katalog else "")
+           + (f" und {n_web} Beiträgen der Website." if a.website else "."), ""]
     aus.append("Fotos zählen zu einem Abend, wenn sie eine Kamera in den Bilddaten haben und zwischen 12 Uhr und 6 Uhr "
                "am Morgen danach aufgenommen sind. Gleiche Inhalte zählen einmal. Scans gelten als unsicher, wenn ihr "
-               "Datum nur vermutet ist. Quelle L heißt aus der Liste, O aus einem Ordnernamen.")
+               "Datum nur vermutet ist. Quelle L heißt aus der Liste, W von der Website, O aus einem Ordnernamen.")
     aus.append("")
     hinweise = [ab for ab in abende.liste if ab["hinweise"]]
     if hinweise:
@@ -273,12 +404,12 @@ def main():
         aus.append("")
         for ab in hinweise:
             kopf = " ".join(x for x in (f"{ab['datum']:%d.%m.%Y}", ab["kennung"], ab["titel"]) if x)
-            aus.append(f"- {kopf}: " + "; ".join(ab["hinweise"]))
+            aus.append(f"- {kopf}: " + "; ".join(dict.fromkeys(ab["hinweise"])))
         aus.append("")
     aus.append("## Abende")
     aus.append("")
-    aus.append("| Datum | Tag | Kennung | Titel | Ort | Quelle | Fotos | RAW | Kameras | Fotos liegen in | Abendordner | Scans |")
-    aus.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    aus.append("| Datum | Tag | Kennung | Nr. | Titel | Ort | Quelle | Fotos | RAW | Kameras | Fotos liegen in | Abendordner | Scans |")
+    aus.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for ab in abende.liste:
         d = ab["datum"]
         fs = zuordnung[id(ab)]
@@ -295,11 +426,11 @@ def main():
             u = sum(1 for s in sc if s[2])
             if u:
                 sc_text += f" ({u} unsicher)"
-        quelle = "".join(q[0] for q in sorted(ab["quellen"], key=lambda q: q != "Liste"))
-        aus.append(f"| {d:%d.%m.%Y} | {WOCHENTAG[d.weekday()]} | {ab['kennung'] or '–'} | {ab['titel'] or '–'} | "
+        titel = NUMMER.sub("", ab["titel"]).strip() or "–"
+        quelle = "".join(q for q in ("L", "W", "O") if {"L": "Liste", "W": "Website", "O": "Ordner"}[q] in ab["quellen"])
+        aus.append(f"| {d:%d.%m.%Y} | {WOCHENTAG[d.weekday()]} | {ab['kennung'] or '–'} | {ab['nr'] or '–'} | {titel} | "
                    f"{ab['ort'] or '–'} | {quelle} | {len(fs) or '–'} | {raw or '–'} | {kameras} | {orte} | {od_text} | {sc_text} |")
 
-    # Aufnahmetage ohne Abend
     rest = defaultdict(list)
     for f in fotos:
         if f[3] and f[2] not in belegte:
@@ -330,6 +461,8 @@ def main():
             w.writerow(["datum", "kennung", "rolle", "pfad_oder_id", "zusatz"])
             for ab in abende.liste:
                 d = f"{ab['datum']:%Y-%m-%d}"
+                if ab["link"]:
+                    w.writerow([d, ab["kennung"], "website", ab["link"], f"#{ab['web_nr']}" if ab["web_nr"] else ""])
                 for fo in zuordnung[id(ab)]:
                     w.writerow([d, ab["kennung"], "foto", fo[0], fo[3].strftime("%H:%M")])
                 for p, _ in ordner.get(id(ab), []):
@@ -338,7 +471,7 @@ def main():
                     w.writerow([d, ab["kennung"], "scan", sid, art + (" (unsicher)" if u else "")])
 
     mit_fotos = sum(1 for ab in abende.liste if zuordnung[id(ab)])
-    print(f"{len(abende.liste)} Abende ({n_liste} aus der Liste), {mit_fotos} davon mit Fotos, "
+    print(f"{len(abende.liste)} Abende ({n_liste} aus der Liste, {n_website} mit Website-Beitrag), {mit_fotos} mit Fotos, "
           f"{sum(1 for ab in abende.liste if scans.get(id(ab)))} mit Scans, {len(hinweise)} Hinweise, "
           f"{len(auffaellig)} auffällige Tage ohne Abend. Bericht: {a.aus}")
 
