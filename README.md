@@ -35,6 +35,14 @@ Die Plan-Datei hat je Notiz eine Zeile mit drei durch Tabulatoren getrennten Spa
 
 Liest alle CSV-Exporte im Ordner, auch überlappende, und schreibt einen Markdown-Bericht. Die Regeldatei vergibt lesbare Namen und Kategorien, ergänzt Verträge, die das Programm nicht selbst erkennt, und trägt Termine und Kredite ein. Sie enthält persönliche Daten und gehört deshalb nicht in dieses Repo, sondern zu den Kontoauszügen.
 
+## aliase
+
+Kleine Shell-Aliase, die auf allen Rechnern gelten sollen. Einbinden mit einer Zeile in `~/.bash_aliases`:
+
+    [ -f ~/Arbeitsmappe_Lokal/Code/werkzeuge/aliase ] && . ~/Arbeitsmappe_Lokal/Code/werkzeuge/aliase
+
+Gebraucht werden je nach Alias `nmcli`, `cava`, `arecord`, `toot` und `play` (Paket `sox`).
+
 ## Einrichtung
 
     git clone git@github.com:sozialwelten/werkzeuge.git
@@ -48,4 +56,4 @@ Neue Werkzeuge: Datei ohne Endung in diesen Ordner legen, mit `chmod +x` ausfüh
 ## Lizenz
 
 - `pdf_reduktion`: shrinkpdf von Alfred Klomp, angepasst von Vivek Gite, BSD-3-Clause (Lizenztext in der Datei)
-- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `cr2`, `einrichten`: GPL-3.0-or-later, Lizenztext in `LICENSE`
+- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `cr2`, `einrichten`, `aliase`: GPL-3.0-or-later, Lizenztext in `LICENSE`

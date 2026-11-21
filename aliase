@@ -1,0 +1,21 @@
+# Gemeinsame Aliase für alle Rechner. Einbinden in ~/.bash_aliases:
+#   [ -f ~/Arbeitsmappe_Lokal/Code/werkzeuge/aliase ] && . ~/Arbeitsmappe_Lokal/Code/werkzeuge/aliase
+
+alias :q='exit'
+
+# Programm von der Konsole entkoppelt starten
+_fensterlos() { setsid -f "$@" >/dev/null 2>&1; }
+alias fensterlos='_fensterlos'
+
+# Termine der nächsten 7 Tage aus der Nextcloud (Repo wochenblick)
+_wochenblick() { ~/Arbeitsmappe_Lokal/Code/wochenblick/.venv/bin/python ~/Arbeitsmappe_Lokal/Code/wochenblick/wochenblick.py "$@"; }
+alias wochenblick='_wochenblick'
+
+# Freifunk-WLAN in Berlin
+alias freifunk='nmcli device wifi connect "berlin.freifunk.net"'
+
+# Audio: Spektrum anzeigen, Testaufnahme, Aufnahme als Toot, Rauschen zum Konzentrieren
+alias visualisierung='cava'
+alias aufnahme='arecord -D pulse -f cd -c 1 -t wav aufnahmetest.wav'
+alias podcast='echo "toot post \"Beschreibung #Hashtag\" --media aufnahmetest.wav"'
+alias background-noise-enterprise='play -n -c1 synth whitenoise lowpass -1 120 lowpass -1 120 lowpass -1 120'
