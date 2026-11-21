@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Notizen in einem Obsidian-Vault lesen, anlegen und ändern, ohne Dateien hin- und herzukopieren.
+
+Gedacht für die Arbeit mit einer Assistenz im Chat: Die Assistenz gibt einen fertigen
+Befehl, der Mensch fügt ihn ins Terminal ein. Neuer oder geänderter Text kommt über
+die Standardeingabe, meist als Heredoc.
+
+  notiz liste [ORDNER]          alle Notizen, auf Wunsch nur in einem Ordner
+  notiz karte [ORDNER]          alle Notizen mit Stand-Datum und erstem Satz
+  notiz zeige NAME [NAME …] [--kopieren]
+                                Pfad und Inhalt einer oder mehrerer Notizen, mit
+                                --kopieren in die Zwischenablage statt auf den Bildschirm
+  notiz neu PFAD                neue Notiz aus der Standardeingabe, PFAD mit Ordner
+  notiz ersetze NAME            ganze Notiz durch die Standardeingabe ersetzen
+  notiz aendere NAME            Textstellen tauschen, Blöcke aus der Standardeingabe:
+                                    @@@ alt
+                                    bisheriger Text
+                                    @@@ neu
+                                    neuer Text
+                                    @@@ ende
+                                Jeder alte Text muss genau einmal vorkommen, sonst
+                                ändert sich nichts. Mehrere Blöcke nacheinander sind möglich.
+
+NAME ist der Dateiname ohne .md, etwa "Finanzen", oder ein Pfad im Vault,
+etwa "Verwaltung/Finanzen". Der Vault steht in der Umgebungsvariablen OBSIDIAN_VAULT.
+Vor jeder Änderung legt das Programm eine Sicherung unter ~/.local/state/notiz/ an.
+
+Lizenz: GPL-3.0-or-later
+"""
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SICHERUNG = Path.home() / ".local" / "state" / "notiz"
+AUSGESCHLOSSEN = {".obsidian", ".trash", ".git"}
+UNERLAUBT = re.compile(r'[#^\[\]|\\:*?"<>]')
+
+
+def fehler(text):
+    print(f"notiz: {text}", file=sys.stderr)
+    sys.exit(1)
+
+
+def vault():
+    pfad = os.environ.get("OBSIDIAN_VAULT")
+    if not pfad:
+        fehler("OBSIDIAN_VAULT ist nicht gesetzt. Etwa in ~/.bash_aliases: export OBSIDIAN_VAULT=…")
+    v = Path(pfad).expanduser()
+    if not v.is_dir():
+        fehler(f"Vault nicht gefunden: {v}")
+    return v
+
+
+def alle(v):
+    for p in sorted(v.rglob("*.md")):
+        if not AUSGESCHLOSSEN & set(p.relative_to(v).parts):
+            yield p
+
+
+def finden(v, name):
+    name = name.removesuffix(".md")
+    if "/" in name:
+        p = v / (name + ".md")
+        if not p.is_file():
+            fehler(f"keine Notiz unter {name}.md")
+        return p
+    treffer = [p for p in alle(v) if p.stem == name]
+    if not treffer:
+        aehnlich = [p.stem for p in alle(v) if name.lower() in p.stem.lower()]
+        fehler(f"keine Notiz mit dem Namen „{name}“" +
+               (". Ähnliche: " + ", ".join(aehnlich[:10]) if aehnlich else ""))
+    if len(treffer) > 1:
+        fehler("mehrere Notizen mit diesem Namen, bitte mit Ordner angeben: " +
+               ", ".join(str(p.relative_to(v)) for p in treffer))
+    return treffer[0]
+
+
+def eingabe():
+    if sys.stdin.isatty():
+        fehler("kein Text über die Standardeingabe, etwa mit <<'ENDE' … ENDE")
+    text = sys.stdin.read()
+    if not text.strip():
+        fehler("die Eingabe ist leer, nichts geändert")
+    return text if text.endswith("\n") else text + "\n"
+
+
+def pruefen(text, pfad):
+    hinweise = []
+    zeilen = text.splitlines()
+    if zeilen and zeilen[0].strip() == "---":
+        hinweise.append("beginnt mit einem YAML-Kopf, laut Vault-Konventionen nicht erwünscht")
+    if not zeilen or not zeilen[0].startswith("# "):
+        hinweise.append("erste Zeile ist keine Überschrift „# Titel“")
+    letzte = next((z for z in reversed(zeilen) if z.strip()), "")
+    if not re.fullmatch(r"\s*(#[^\s#]+\s*)+", letzte):
+        hinweise.append("letzte Zeile enthält keine Hashtags")
+    for h in hinweise:
+        print(f"Hinweis zu {pfad.name}: {h}", file=sys.stderr)
+
+
+def sichern(p):
+    SICHERUNG.mkdir(parents=True, exist_ok=True)
+    stempel = f"{datetime.now():%Y-%m-%d_%H%M%S}"
+    ziel = SICHERUNG / f"{p.stem}.{stempel}.md"
+    n = 2
+    while ziel.exists():
+        ziel = SICHERUNG / f"{p.stem}.{stempel}_{n}.md"
+        n += 1
+    ziel.write_bytes(p.read_bytes())
+    return ziel
+
+
+def schreiben(p, text, vorher=None):
+    p.write_text(text, encoding="utf-8")
+    zeilen = len(text.splitlines())
+    if vorher is None:
+        print(f"angelegt: {p} ({zeilen} Zeilen)")
+    else:
+        print(f"geschrieben: {p} ({zeilen} Zeilen, vorher {len(vorher.splitlines())})")
+
+
+def liste(v, ordner=None):
+    basis = v / ordner if ordner else v
+    if not basis.is_dir():
+        fehler(f"Ordner nicht gefunden: {ordner}")
+    for p in alle(v):
+        if basis in p.parents:
+            print(p.relative_to(v).with_suffix(""))
+
+
+STAND = re.compile(r"Stand[:\s*]+(?:[A-Za-zäöü]+,\s*)?(\d{1,2}\.\d{1,2}\.\d{4}|\d{4}-\d{2}-\d{2})")
+
+
+def kopf(p):
+    """Stand-Datum, erster Satz und Vertraulichkeit aus dem Anfang einer Notiz."""
+    zeilen = p.read_text(encoding="utf-8").splitlines()[:40]
+    anfang = "\n".join(zeilen[:8])
+    m = STAND.search(anfang)
+    stand = m.group(1) if m else "ohne Stand"
+    vertraulich = "vertraulich" in anfang.lower()
+    satz = ""
+    for z in zeilen:
+        t = z.strip()
+        if (not t or t.startswith(("#", "|", "```", "---", ">")) or t.lower().startswith("vertraulich") or re.fullmatch(r"\**Stand[^a-z]*", t)
+                or re.match(r"\**Stand[:\s]", t) and len(t) < 40):
+            continue
+        t = re.sub(r"\*\*|`|\[\[|\]\]", "", t)
+        t = re.sub(r"^\**Stand[:\s*]+(?:[A-Za-zäöü]+,\s*)?[\d.\-]+(?:,?\s*[\d:]+\s*Uhr)?\.?\**:?\**\s*", "", t) or t
+        satz = re.split(r"(?<=[.!?])\s", t)[0]
+        break
+    if len(satz) > 140:
+        satz = satz[:137].rstrip() + " …"
+    return stand, satz, vertraulich
+
+
+def karte(v, ordner=None):
+    basis = v / ordner if ordner else v
+    if not basis.is_dir():
+        fehler(f"Ordner nicht gefunden: {ordner}")
+    for p in alle(v):
+        if basis in p.parents:
+            stand, satz, vertraulich = kopf(p)
+            marke = "[vertraulich] " if vertraulich else ""
+            print(f"{p.relative_to(v).with_suffix('')} | {stand} | {marke}{satz}")
+
+
+def zwischenablage(text):
+    for befehl in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        if shutil.which(befehl[0]):
+            subprocess.run(befehl, input=text.encode("utf-8"), check=True)
+            return befehl[0]
+    fehler("kein Programm für die Zwischenablage gefunden. Unter Wayland: sudo apt install wl-clipboard")
+
+
+def zeige(v, namen, kopieren=False):
+    teile = []
+    for name in namen:
+        p = finden(v, name)
+        teile.append(f"==== {p.relative_to(v)} ====\n" + p.read_text(encoding="utf-8"))
+    text = "\n".join(teile)
+    if kopieren:
+        programm = zwischenablage(text)
+        print(f"{len(teile)} Notiz(en), {len(text)} Zeichen in der Zwischenablage ({programm}). Jetzt im Chat einfügen.")
+    else:
+        sys.stdout.write(text)
+
+
+def neu(v, pfad):
+    pfad = pfad.removesuffix(".md")
+    p = v / (pfad + ".md")
+    if UNERLAUBT.search(p.stem):
+        fehler(f"unerlaubtes Zeichen im Dateinamen: {p.stem}")
+    if not p.parent.is_dir():
+        fehler(f"Ordner gibt es nicht: {p.parent.relative_to(v)}. Neue Ordner nur nach Absprache, dann von Hand anlegen")
+    if p.exists():
+        fehler(f"{pfad}.md gibt es schon. Zum Ändern „notiz ersetze“ oder „notiz aendere“")
+    gleich = [q for q in alle(v) if q.stem == p.stem]
+    if gleich:
+        fehler(f"der Name „{p.stem}“ ist schon vergeben: {gleich[0].relative_to(v)}")
+    text = eingabe()
+    pruefen(text, p)
+    schreiben(p, text)
+
+
+def ersetze(v, name):
+    p = finden(v, name)
+    text = eingabe()
+    vorher = p.read_text(encoding="utf-8")
+    pruefen(text, p)
+    s = sichern(p)
+    schreiben(p, text, vorher)
+    print(f"Sicherung: {s}")
+
+
+def aendere(v, name):
+    p = finden(v, name)
+    roh = eingabe()
+    bloecke = re.findall(r"^@@@ alt\n(.*?)^@@@ neu\n(.*?)^@@@ ende\s*$", roh, flags=re.S | re.M)
+    if not bloecke:
+        fehler("keine Blöcke gefunden. Form: @@@ alt / Text / @@@ neu / Text / @@@ ende, je auf eigener Zeile")
+    vorher = p.read_text(encoding="utf-8")
+    text = vorher
+    for i, (alt, neu_) in enumerate(bloecke, 1):
+        n = text.count(alt)
+        if n != 1:
+            anfang = alt.strip().splitlines()[0][:60] if alt.strip() else "(leer)"
+            fehler(f"Block {i}: alter Text kommt {n} Mal vor statt genau einmal, nichts geändert. Anfang: „{anfang}“")
+        text = text.replace(alt, neu_, 1)
+    s = sichern(p)
+    schreiben(p, text, vorher)
+    print(f"{len(bloecke)} Stelle(n) geändert. Sicherung: {s}")
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "hilfe"):
+        print(__doc__.strip())
+        return
+    befehl, rest = a[0], a[1:]
+    v = vault()
+    if befehl == "liste" and len(rest) <= 1:
+        liste(v, *rest)
+    elif befehl == "karte" and len(rest) <= 1:
+        karte(v, *rest)
+    elif befehl == "zeige" and [r for r in rest if r != "--kopieren"]:
+        zeige(v, [r for r in rest if r != "--kopieren"], "--kopieren" in rest)
+    elif befehl == "neu" and len(rest) == 1:
+        neu(v, rest[0])
+    elif befehl == "ersetze" and len(rest) == 1:
+        ersetze(v, rest[0])
+    elif befehl == "aendere" and len(rest) == 1:
+        aendere(v, rest[0])
+    else:
+        fehler("unbekannter Aufruf. Übersicht mit „notiz hilfe“")
+
+
+if __name__ == "__main__":
+    main()
