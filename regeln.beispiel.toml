@@ -1,0 +1,64 @@
+# Muster für kontoauswertung. Alle Namen und Beträge sind ausgedacht.
+# Muster sind reguläre Ausdrücke, Groß- und Kleinschreibung egal.
+# Ein vorangestelltes "+:" oder "-:" lässt eine Regel nur für Eingänge
+# bzw. nur für Ausgänge gelten.
+
+# Überschrift und Schlagworte (z. B. Obsidian-Hashtags) für den Bericht, beides optional
+titel = "Kontoauswertung"
+schlagworte = "#Finanzen"
+
+# Gegenüber, die nie als wiederkehrend gelten sollen, auch wenn sie oft vorkommen
+nicht_wiederkehrend = ["eBay", "Dispo-Abruf"]
+
+# Kategorien, die nicht in den üblichen Verbrauch eingehen, etwa Auslagen, die erstattet werden
+nicht_im_verbrauch = ["Auslagen"]
+
+# Lesbare Namen für das Gegenüber. Die erste passende Regel gewinnt.
+[namen]
+"STADTWERKE MUSTERSTADT" = "Strom"
+"+:MUSTERBANK" = "Musterbank, Abruf"
+"-:MUSTERBANK" = "Musterbank, Rate"
+"BEISPIEL GMBH" = "Gehalt"
+
+# Kategorien. Ein Umsatz kommt in die erste Kategorie, deren Muster passt.
+[kategorien]
+"Lebensmittel" = ["REWE", "EDEKA", "LIDL", "ALDI"]
+"Wohnen" = ["Strom", "Hausverwaltung"]
+"Kredit" = ["-:Musterbank"]
+"Gehalt" = ["Gehalt"]
+
+# Verträge, die das Programm nicht selbst erkennt, etwa eine Jahreszahlung,
+# die erst einmal im Zeitraum der Exporte vorkam
+[[vertrag]]
+name = "Domain und Hosting"
+rhythmus = "jährlich"          # monatlich, alle zwei Monate, vierteljährlich, halbjährlich, jährlich
+betrag = -60.00
+zuletzt = "2026-03-15"
+kategorie = "Digitale Dienste"
+# bis = "2027-12-31"           # optional: letzte Fälligkeit
+# ersetzt = "Strom"            # optional: erkannte Zahlung dieses Namens, die der Eintrag ersetzt
+
+# Wiederkehrende Zahlungen mit bekanntem Ende: Name = letzter Tag
+[endet]
+"Musterbank, Rate" = "2027-06-30"
+
+# Einzelne künftige Zahlungen, etwa eine Schlussrate oder eine Erstattung
+[[einmalig]]
+name = "Musterbank, Schlussrate"
+datum = "2027-07-01"
+betrag = -120.00
+
+# Termine ohne Betrag stehen im Kalender, zählen aber nicht in die Summen
+[[einmalig]]
+name = "Nebenkostenabrechnung"
+datum = "2027-05-15"
+hinweis = "Vorjahr Nachzahlung 120 €"
+
+# Kredite mit Tilgungsplan. Stand als positive Zahl, Zins als Monatssatz in Prozent.
+[[kredit]]
+name = "Musterbank"
+stand = 3000.00
+stand_vom = "laut Kontoauszug vom 01.11.2026"
+zins_monat = 1.0
+rate = 500.00
+erste_rate = "2026-12-01"

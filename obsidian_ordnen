@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Einen Obsidian-Vault nach einer Liste umbenennen, verschieben und vereinheitlichen.
+
+  obsidian_ordnen VAULT PLAN.tsv              zeigt nur, was geschehen würde
+  obsidian_ordnen VAULT PLAN.tsv --ausfuehren legt eine Sicherung an und führt aus
+
+PLAN.tsv hat je Zeile drei Spalten, getrennt durch Tabulatoren:
+
+  alter Pfad <TAB> neuer Pfad <TAB> Hashtags
+
+Pfade relativ zum Vault, ohne „.md“. Ist der neue Pfad leer, bleibt die Datei, wo
+sie ist. Die Hashtags (durch Leerzeichen getrennt, mit #) stehen danach in der
+letzten Zeile der Datei; eine vorhandene Hashtag-Zeile am Ende wird ersetzt.
+Zeilen, die mit # beginnen, sind Kommentare.
+
+Beim Ausführen geschieht dies:
+
+1. Sicherung des ganzen Vaults als .tar.gz (Pfad mit --sicherung, sonst im
+   Elternordner des Vaults).
+2. Umbenennen und Verschieben.
+3. In allen Markdown-Dateien werden Links nachgezogen: [[alt]], [[alt|…]],
+   [[alt#…]], ![[alt]] und [[Ordner/alt]] zeigen danach auf den neuen Namen.
+   Dateinamen in Backticks wie `alt.md` werden zu [[neu]].
+4. Ein YAML-Kopf am Anfang der Datei wird entfernt. Termin, Stand, Beteiligte
+   und Quelle bleiben als eine schlichte Zeile erhalten.
+5. Die Hashtag-Zeile wird gesetzt.
+
+Ordner, die danach leer sind, werden entfernt. .obsidian und .trash bleiben unberührt.
+
+Lizenz: GPL-3.0-or-later
+"""
+
+import argparse
+import re
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+BEHALTEN = [
+    ("termin", "Termin"), ("geschätztes_datum", "Termin"), ("zeitraum", "Zeitraum"),
+    ("stand", "Stand"), ("beteiligte", "Beteiligte"), ("sprecher", "Beteiligte"),
+    ("quelle", "Quelle"), ("grundlage", "Grundlage"),
+]
+TAGZEILE = re.compile(r"^\s*(#[^\s#]+\s*)+$")
+
+
+def plan_lesen(datei):
+    eintraege = []
+    for nr, zeile in enumerate(Path(datei).read_text(encoding="utf-8").splitlines(), 1):
+        if not zeile.strip() or zeile.startswith("#"):
+            continue
+        teile = zeile.split("\t")
+        while len(teile) < 3:
+            teile.append("")
+        alt, neu, tags = (t.strip() for t in teile[:3])
+        eintraege.append((nr, alt, neu or alt, tags.split()))
+    return eintraege
+
+
+def pruefen(vault, plan):
+    fehler = []
+    ziele = {}
+    namen = {}
+    for nr, alt, neu, tags in plan:
+        if not (vault / f"{alt}.md").is_file():
+            fehler.append(f"Zeile {nr}: nicht gefunden: {alt}.md")
+        if neu in ziele:
+            fehler.append(f"Zeile {nr}: Ziel doppelt: {neu} (auch Zeile {ziele[neu]})")
+        ziele[neu] = nr
+        if alt != neu and (vault / f"{neu}.md").exists() and neu not in {a for _, a, _, _ in plan}:
+            fehler.append(f"Zeile {nr}: Ziel existiert schon: {neu}.md")
+        for t in tags:
+            if not re.fullmatch(r"#[\wÄÖÜäöüß/\-]+", t):
+                fehler.append(f"Zeile {nr}: ungültiger Hashtag {t}")
+    for nr, alt, neu, _ in plan:
+        n = Path(neu).name
+        if n in namen and namen[n] != neu:
+            fehler.append(f"Zeile {nr}: Dateiname {n} kommt zweimal vor, Links wären nicht eindeutig")
+        namen[n] = neu
+    return fehler
+
+
+def yaml_zu_zeile(text):
+    if not text.startswith("---\n"):
+        return text, False
+    ende = text.find("\n---", 4)
+    if ende < 0:
+        return text, False
+    kopf = text[4:ende]
+    rest = text[ende + 4:].lstrip("\n")
+    for z in kopf.splitlines():
+        if z.strip() and not re.match(r"^([\wäöüß]+:|\s+-\s|-\s|\s+\S)", z):
+            return text, False
+    werte = {}
+    schluessel = None
+    for z in kopf.splitlines():
+        m = re.match(r"^([\wäöüß]+):\s*(.*)$", z)
+        if m:
+            schluessel = m.group(1)
+            werte[schluessel] = [m.group(2).strip().strip('"')] if m.group(2).strip() else []
+        elif z.strip().startswith("- ") and schluessel:
+            werte[schluessel].append(z.strip()[2:].strip().strip('"'))
+    teile = []
+    gesehen = set()
+    for k, name in BEHALTEN:
+        if k in werte and werte[k] and name not in gesehen:
+            teile.append(f"{name}: {', '.join(w for w in werte[k] if w)}")
+            gesehen.add(name)
+    zeile = ". ".join(teile)
+    if zeile:
+        zeile += "."
+        if rest.startswith("# "):
+            erste, _, danach = rest.partition("\n")
+            return f"{erste}\n\n{zeile}\n{danach}", True
+        return f"{zeile}\n\n{rest}", True
+    return rest, True
+
+
+def tags_setzen(text, tags):
+    if not tags:
+        return text
+    zeilen = text.rstrip("\n").split("\n")
+    if zeilen and TAGZEILE.match(zeilen[-1]):
+        vorhanden = zeilen[-1].split()
+        zeilen = zeilen[:-1]
+        tags = vorhanden + [t for t in tags if t not in vorhanden]
+    while zeilen and not zeilen[-1].strip():
+        zeilen.pop()
+    return "\n".join(zeilen) + "\n\n" + " ".join(tags) + "\n"
+
+
+def links_ersetzen(text, umbenennung, pfade=None):
+    pfade = pfade or {}
+
+    def wiki(m):
+        bang, ziel, rest = m.group(1), m.group(2), m.group(3)
+        if ziel.endswith(".md"):
+            ziel = ziel[:-3]
+        if "/" in ziel and ziel in pfade:
+            return f"{bang}[[{pfade[ziel]}{rest}]]"
+        name = ziel.split("/")[-1]
+        if name in umbenennung:
+            return f"{bang}[[{umbenennung[name]}{rest}]]"
+        return m.group(0)
+
+    text = re.sub(r"(!?)\[\[([^\]|#]+)((?:[#|][^\]]*)?)\]\]", wiki, text)
+
+    def backtick(m):
+        name = m.group(1)
+        if name in umbenennung:
+            return f"[[{umbenennung[name]}]]"
+        return m.group(0)
+
+    return re.sub(r"`([^`/]+?)\.md`", backtick, text)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Obsidian-Vault nach Plan ordnen")
+    ap.add_argument("vault")
+    ap.add_argument("plan")
+    ap.add_argument("--ausfuehren", action="store_true")
+    ap.add_argument("--sicherung")
+    args = ap.parse_args()
+    vault = Path(args.vault).expanduser().resolve()
+    plan = plan_lesen(args.plan)
+
+    fehler = pruefen(vault, plan)
+    if fehler:
+        print("Der Plan hat Fehler, es wird nichts geändert:")
+        for f in fehler:
+            print("  " + f)
+        sys.exit(1)
+
+    umbenennung = {Path(a).name: Path(n).name for _, a, n, _ in plan if Path(a).name != Path(n).name}
+    pfade = {a: Path(n).name for _, a, n, _ in plan if a != n}
+    alle_md = [p for p in vault.rglob("*.md") if ".obsidian" not in p.parts and ".trash" not in p.parts]
+    im_plan = {f"{a}.md" for _, a, _, _ in plan}
+    nicht_im_plan = sorted(str(p.relative_to(vault)) for p in alle_md if str(p.relative_to(vault)) not in im_plan)
+
+    verschiebungen = [(a, n) for _, a, n, _ in plan if a != n]
+    yaml_dateien = [a for _, a, _, _ in plan if (vault / f"{a}.md").read_text(encoding="utf-8").startswith("---\n")]
+    link_dateien = 0
+    for p in alle_md:
+        t = p.read_text(encoding="utf-8")
+        if links_ersetzen(t, umbenennung, pfade) != t:
+            link_dateien += 1
+
+    print(f"Vault: {vault}")
+    print(f"{len(plan)} Dateien im Plan, {len(verschiebungen)} werden umbenannt oder verschoben:")
+    for a, n in verschiebungen:
+        print(f"  {a}\n    → {n}")
+    print(f"\nYAML-Kopf wird in eine Zeile umgewandelt: {len(yaml_dateien)} Dateien")
+    print(f"Links werden nachgezogen in: {link_dateien} Dateien")
+    print(f"Hashtags werden gesetzt in: {sum(1 for _, _, _, t in plan if t)} Dateien")
+    if nicht_im_plan:
+        print(f"\nNicht im Plan, bleiben unverändert: {len(nicht_im_plan)}")
+        for n in nicht_im_plan:
+            print("  " + n)
+
+    if not args.ausfuehren:
+        print("\nNur Vorschau. Mit --ausfuehren wird es umgesetzt.")
+        return
+
+    sicherung = Path(args.sicherung).expanduser() if args.sicherung else \
+        vault.parent / f"{vault.name}_sicherung_{time.strftime('%Y-%m-%d_%H%M')}.tar.gz"
+    with tarfile.open(sicherung, "w:gz") as tar:
+        tar.add(vault, arcname=vault.name)
+    print(f"\nSicherung: {sicherung} ({sicherung.stat().st_size / 1e6:.1f} MB)")
+
+    for a, n in verschiebungen:
+        ziel = vault / f"{n}.md"
+        ziel.parent.mkdir(parents=True, exist_ok=True)
+        (vault / f"{a}.md").rename(ziel)
+
+    tags_je_datei = {f"{n}.md": t for _, _, n, t in plan}
+    geaendert = 0
+    for p in [p for p in vault.rglob("*.md") if ".obsidian" not in p.parts and ".trash" not in p.parts]:
+        rel = str(p.relative_to(vault))
+        t = p.read_text(encoding="utf-8")
+        neu = links_ersetzen(t, umbenennung, pfade)
+        if rel in tags_je_datei:
+            neu, _ = yaml_zu_zeile(neu)
+            neu = tags_setzen(neu, tags_je_datei[rel])
+        if neu != t:
+            p.write_text(neu, encoding="utf-8")
+            geaendert += 1
+
+    for d in sorted((d for d in vault.rglob("*") if d.is_dir()), key=lambda d: -len(d.parts)):
+        if ".obsidian" in d.parts or ".trash" in d.parts:
+            continue
+        if not any(d.iterdir()):
+            d.rmdir()
+            print(f"Leerer Ordner entfernt: {d.relative_to(vault)}")
+
+    print(f"Fertig: {len(verschiebungen)} verschoben, {geaendert} Dateien inhaltlich angepasst.")
+
+
+if __name__ == "__main__":
+    main()

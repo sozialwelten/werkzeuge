@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Kontoumsätze auswerten: wiederkehrende Zahlungen, Zahlungskalender, Kategorien.
+
+  kontoauswertung ORDNER_MIT_CSV --regeln regeln.toml --aus bericht.md [--monate 12]
+
+Liest alle CSV-Exporte im Ordner (Format Santander/Openbank: Kopfzeile
+„Buchungsdatum;Wertstellung;Betrag(EUR);Saldo(EUR);Verwendungszweck“),
+entfernt Doppelungen aus überlappenden Exporten und schreibt einen Bericht:
+
+1. Zahlungskalender für die kommenden Monate mit dem tatsächlichen
+   Fälligkeitsmonat jeder Zahlung, auch der jährlichen und vierteljährlichen,
+   und dem üblichen übrigen Verbrauch (Median der letzten sechs Monate) als Vergleich
+2. Tilgungsplan für jeden Kredit aus der Regeldatei
+3. wiederkehrende Zahlungen mit Rhythmus, Betrag, letzter und nächster Fälligkeit
+4. Kontoverlauf je Monat: tiefster und höchster Stand, Ein- und Ausgänge
+5. Ausgaben je Kategorie und Monat
+6. Zahlungen, die nirgends zugeordnet sind
+
+Wiederkehrende Zahlungen erkennt das Programm selbst an gleichem Gegenüber,
+ähnlichem Betrag und regelmäßigem Abstand. Was es nicht erkennen kann, etwa
+eine Jahreszahlung, die erst einmal vorkam, oder ein Vertrag, der endet,
+steht in der Regeldatei. Ein Muster liegt als regeln.beispiel.toml bei.
+
+Lizenz: GPL-3.0-or-later
+"""
+
+import argparse
+import csv
+import re
+import statistics
+import sys
+import tomllib
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+RHYTHMEN = [  # Name, Tage, Toleranz, Mindestzahl
+    ("monatlich", 30.4, 6, 3),
+    ("alle zwei Monate", 61, 8, 2),
+    ("vierteljährlich", 91, 10, 2),
+    ("halbjährlich", 182, 15, 2),
+    ("jährlich", 365, 25, 2),
+]
+MONATE = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August",
+          "September", "Oktober", "November", "Dezember"]
+
+
+def euro(x):
+    s = f"{abs(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return ("−" if x < 0 else "") + s + " €"
+
+
+def zahl(s):
+    return float(s.replace(".", "").replace(",", "."))
+
+
+def monat_plus(d, n):
+    m = d.month - 1 + n
+    j = d.year + m // 12
+    m = m % 12 + 1
+    tag = min(d.day, [31, 29 if j % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
+    return date(j, m, tag)
+
+
+def einlesen(ordner):
+    zeilen = {}
+    for f in sorted(Path(ordner).glob("*.csv")):
+        text = f.read_text(encoding="utf-8-sig").replace("\r", "").split("\n")
+        try:
+            start = next(i for i, z in enumerate(text) if z.startswith("Buchungsdatum;"))
+        except StopIteration:
+            print(f"übersprungen, kein Kontoexport: {f.name}", file=sys.stderr)
+            continue
+        for x in csv.reader(text[start + 1:], delimiter=";"):
+            if len(x) >= 5 and x[0]:
+                zeilen[tuple(x[:5])] = x
+    umsaetze = []
+    for x in zeilen.values():
+        umsaetze.append({
+            "datum": datetime.strptime(x[0], "%d.%m.%Y").date(),
+            "betrag": zahl(x[2]), "saldo": zahl(x[3]),
+            "text": re.sub(r"\s+", " ", x[4]).strip(),
+        })
+    umsaetze.sort(key=lambda u: u["datum"])
+    return umsaetze
+
+
+def gegenueber(text):
+    muster = [
+        (r"^SEPA-KARTENZAHLUNG \S+ (?:AUT )?(.*?)//", None),
+        (r"^(?:SEPA-GAA AUSZAHLUNG|BARGELDAUSZAHLUNG)", "Bargeld"),
+        (r"^Kontoabschluss", "Kontoabschluss"),
+        (r"^ZAHLUNG AN (.*?) (?:VOM|\d)", None),
+        (r"^SEPA-LASTSCHRIFT VON (.*?) 3293\d", None),
+        (r"^(?:ECHTZEIT-)?ÜBERWEISUNG (?:VON|AN) (.*?) 3293\d", None),
+    ]
+    for m, fest in muster:
+        t = re.match(m, text)
+        if t:
+            name = fest or t.group(1).strip()
+            break
+    else:
+        name = text[:40]
+    if name.startswith("PayPal"):
+        sv = re.search(r"SVWZ\+(.*)", text)
+        sv = sv.group(1) if sv else ""
+        e = re.search(r"Ihr Einkauf bei (.*?)(?:,|$)", sv)
+        if e:
+            return "PayPal: " + e.group(1).strip()
+        sv = re.sub(r"^\S+ PP\.\d+\.PP \. ?", "", sv).split("/")[0].strip()
+        return "PayPal: " + (sv[:40] or "ohne Angabe")
+    return name
+
+
+def regeln_lesen(datei):
+    if not datei:
+        return {}
+    with open(datei, "rb") as f:
+        return tomllib.load(f)
+
+
+def zuordnen(umsaetze, regeln):
+    namen = []
+    for m, n in regeln.get("namen", {}).items():
+        vz = m[0] if m[:2] in ("+:", "-:") else ""
+        namen.append((re.compile(m[2:] if vz else m, re.I), n, vz))
+    kat = []
+    for k, liste in regeln.get("kategorien", {}).items():
+        for m in liste:
+            vz = m[0] if m[:2] in ("+:", "-:") else ""
+            kat.append((re.compile(m[2:] if vz else m, re.I), k, vz))
+    for u in umsaetze:
+        g = gegenueber(u["text"])
+        vorz = "+" if u["betrag"] > 0 else "-"
+        for m, n, vz in namen:
+            if (not vz or vz == vorz) and (m.search(g) or m.search(u["text"])):
+                g = n
+                break
+        u["gegen"] = g
+        u["kategorie"] = next((k for m, k, vz in kat if (not vz or vz == vorz) and (m.search(g) or m.search(u["text"]))),
+                              "ohne Kategorie")
+
+
+def wiederkehrend(umsaetze, regeln, heute):
+    gruppen = defaultdict(list)
+    for u in umsaetze:
+        if u["gegen"] in ("Bargeld", "Kontoabschluss"):
+            continue
+        gruppen[(u["gegen"], u["betrag"] > 0)].append(u)
+    ignorieren = set(regeln.get("nicht_wiederkehrend", []))
+    ergebnis = []
+    for (name, ein), liste in gruppen.items():
+        if name in ignorieren or len(liste) < 2:
+            continue
+        haufen = []
+        for u in sorted(liste, key=lambda u: u["betrag"]):
+            if haufen and abs(u["betrag"] - statistics.median(x["betrag"] for x in haufen[-1])) <= max(abs(u["betrag"]) * 0.2, 2):
+                haufen[-1].append(u)
+            else:
+                haufen.append([u])
+        gefunden = []
+        for nah in haufen:
+            nah.sort(key=lambda u: u["datum"])
+            if len(nah) < 2:
+                continue
+            tage = [(b["datum"] - a["datum"]).days for a, b in zip(nah, nah[1:])]
+            abstand = statistics.median(tage)
+            for rname, soll, tol, mind in RHYTHMEN:
+                if abs(abstand - soll) <= tol and len(nah) >= mind:
+                    streu = sum(1 for t in tage if abs(t - soll) > tol * 2)
+                    if streu > len(tage) / 3:
+                        continue
+                    letzte = nah[-1]["datum"]
+                    gefunden.append({
+                        "name": name, "rhythmus": rname, "tage": soll,
+                        "betrag": round(statistics.median([u["betrag"] for u in nah[-3:]]), 2),
+                        "letzte": letzte, "anzahl": len(nah), "aktiv": (heute - letzte).days <= soll * 1.6,
+                        "tag": round(statistics.median([u["datum"].day for u in nah[-6:]])),
+                        "kategorie": nah[-1]["kategorie"], "quelle": "erkannt",
+                    })
+                    break
+        if len([g for g in gefunden if g["aktiv"]]) > 1:
+            for g in gefunden:
+                g["name"] = f"{g['name']} ({euro(g['betrag'])})"
+        ergebnis.extend(gefunden)
+    # Angaben aus der Regeldatei haben Vorrang
+    for v in regeln.get("vertrag", []):
+        alt = v.get("ersetzt", v["name"])
+        ergebnis = [e for e in ergebnis if not (e["name"] == alt or e["name"].startswith(alt + " ("))]
+        r = next(r for r in RHYTHMEN if r[0] == v["rhythmus"])
+        ergebnis.append({
+            "name": v["name"], "rhythmus": v["rhythmus"], "tage": r[1],
+            "betrag": float(v["betrag"]), "letzte": date.fromisoformat(v["zuletzt"]),
+            "anzahl": None, "aktiv": True, "tag": date.fromisoformat(v["zuletzt"]).day,
+            "kategorie": v.get("kategorie", "Vertrag"), "quelle": "Regeldatei",
+            "bis": date.fromisoformat(v["bis"]) if v.get("bis") else None,
+            "hinweis": v.get("hinweis", ""),
+        })
+    for e in ergebnis:
+        e.setdefault("bis", None)
+        e.setdefault("hinweis", "")
+        for name, bis in regeln.get("endet", {}).items():
+            if e["name"] == name:
+                e["bis"] = date.fromisoformat(bis)
+    return sorted(ergebnis, key=lambda e: (not e["aktiv"], e["betrag"] > 0, e["betrag"]))
+
+
+def termine(e, von, bis):
+    schritt = {"monatlich": 1, "alle zwei Monate": 2, "vierteljährlich": 3, "halbjährlich": 6, "jährlich": 12}[e["rhythmus"]]
+    d = e["letzte"]
+    n = 0
+    while True:
+        n += schritt
+        t = monat_plus(e["letzte"], n)
+        t = t.replace(day=min(e["tag"], 28)) if e["rhythmus"] == "monatlich" else t
+        if t > bis or (e["bis"] and t > e["bis"]):
+            return
+        if t >= von:
+            yield t
+
+
+def bericht(umsaetze, wk, regeln, monate, heute):
+    aus = [f"# {regeln.get('titel', 'Kontoauswertung')}", ""]
+    erster, letzter = umsaetze[0]["datum"], umsaetze[-1]["datum"]
+    stand = umsaetze[-1]["saldo"]
+    aus.append(f"Erstellt {date.today():%d.%m.%Y} aus {len(umsaetze)} Umsätzen vom {erster:%d.%m.%Y} bis {letzter:%d.%m.%Y}. "
+               f"Kontostand am {letzter:%d.%m.%Y}: {euro(stand)}.")
+    aus.append("")
+
+    # 1. Kalender
+    aus.append("## Zahlungskalender")
+    aus.append("")
+    aus.append("Jede wiederkehrende Zahlung steht in dem Monat, in dem sie tatsächlich fällig wird. "
+               "Was nicht monatlich kommt, ist **fett**. Einkäufe, Karte und Bargeld sind hier nicht enthalten, "
+               "sie stehen in der Übersicht je Kategorie.")
+    aus.append("")
+    start = date(heute.year, heute.month, 1)
+    aktive = [e for e in wk if e["aktiv"]]
+    feste = {e["name"] for e in wk} | {e["name"].split(" (")[0] for e in wk}
+    feste |= {v["ersetzt"] for v in regeln.get("vertrag", []) if v.get("ersetzt")}
+    ohne = set(regeln.get("nicht_im_verbrauch", []))
+    uebrig_je_monat = defaultdict(float)
+    for u in umsaetze:
+        if u["betrag"] < 0 and u["gegen"] not in feste and u["kategorie"] not in ohne:
+            uebrig_je_monat[(u["datum"].year, u["datum"].month)] += u["betrag"]
+    volle = [k for k in sorted(uebrig_je_monat) if k < (heute.year, heute.month)][-6:]
+    uebrig = statistics.median(uebrig_je_monat[k] for k in volle) if volle else 0
+    aus.append(f"Für alles Übrige, also Einkäufe, Karte, PayPal, Bargeld und einmalige Zahlungen, gingen in den "
+               f"letzten sechs vollen Monaten im Mittel {euro(uebrig)} im Monat ab (Median, "
+               f"{MONATE[volle[0][1] - 1]} {volle[0][0]} bis {MONATE[volle[-1][1] - 1]} {volle[-1][0]}). "
+               "Diese Zahl steht unter jedem Monat als Vergleich, im laufenden Monat nur der Anteil der restlichen Tage. "
+               "Der voraussichtliche Kontostand am Monatsende rechnet ab dem heutigen Stand mit diesem Verbrauch weiter.")
+    aus.append("")
+    lauf = stand
+    for i in range(monate):
+        m0 = monat_plus(start, i)
+        m1 = monat_plus(start, i + 1) - timedelta(days=1)
+        posten = []
+        for e in aktive:
+            for t in termine(e, max(m0, heute + timedelta(days=1)), m1):
+                posten.append((t, e))
+        for p in regeln.get("einmalig", []):
+            t = date.fromisoformat(p["datum"])
+            if m0 <= t <= m1 and t > heute:
+                termin = "betrag" not in p
+                posten.append((t, {"name": p["name"], "betrag": 0.0 if termin else float(p["betrag"]),
+                                   "rhythmus": "Termin" if termin else "einmalig", "hinweis": p.get("hinweis", "")}))
+        posten.sort(key=lambda p: (p[0], p[1]["betrag"]))
+        ein = sum(e["betrag"] for _, e in posten if e["betrag"] > 0)
+        ausg = sum(e["betrag"] for _, e in posten if e["betrag"] < 0)
+        aus.append(f"### {MONATE[m0.month - 1]} {m0.year}")
+        aus.append("")
+        anteil = 1.0
+        if m0 <= heute <= m1:
+            anteil = (m1 - heute).days / m1.day
+        verbrauch = uebrig * anteil
+        lauf += ein + ausg + verbrauch
+        aus.append(f"Eingänge {euro(ein)}, feste Ausgänge {euro(ausg)}, bleiben {euro(ein + ausg)} für alles Übrige. "
+                   f"Bei üblichem Verbrauch ({euro(verbrauch)}) ergäbe das {euro(ein + ausg + verbrauch)}. "
+                   f"Voraussichtlicher Kontostand am {m1:%d.%m.%Y}: **{euro(lauf)}**.")
+        aus.append("")
+        aus.append("| Tag | Posten | Betrag | Rhythmus |")
+        aus.append("|---|---|---|---|")
+        for t, e in posten:
+            fett = e["rhythmus"] != "monatlich"
+            n = f"**{e['name']}**" if fett else e["name"]
+            r = f"**{e['rhythmus']}**" if fett else e["rhythmus"]
+            if e.get("hinweis"):
+                n += f" ({e['hinweis']})"
+            betrag = "" if e["rhythmus"] == "Termin" else euro(e["betrag"])
+            aus.append(f"| {t:%d.%m.} | {n} | {betrag} | {r} |")
+        aus.append("")
+
+    # 2. Wiederkehrende
+    for k in regeln.get("kredit", []):
+        aus.append(f"## Tilgungsplan {k['name']}")
+        aus.append("")
+        rest, zins, rate = float(k["stand"]), float(k["zins_monat"]) / 100, float(k["rate"])
+        d = date.fromisoformat(k["erste_rate"])
+        aus.append(f"Ausgangsstand {euro(-rest)} ({k.get('stand_vom', 'Stand laut Regeln')}), Zins {str(k['zins_monat']).replace('.', ',')} % "
+                   f"im Monat, Rate {euro(-rate)}. Ohne weitere Abrufe:")
+        aus.append("")
+        aus.append("| Monat | Zinsen | Rate | Rest danach |")
+        aus.append("|---|---|---|---|")
+        summe = 0.0
+        while rest > 0.005 and len(aus) < 10000:
+            z = round(rest * zins, 2)
+            r = min(rate, rest + z)
+            rest = round(rest + z - r, 2)
+            summe += z
+            aus.append(f"| {MONATE[d.month - 1]} {d.year} | {euro(-z)} | {euro(-r)} | {euro(-rest)} |")
+            d = monat_plus(d, 1)
+        aus.append("")
+        aus.append(f"Zinsen bis zum Ende zusammen {euro(-summe)}. Jeder neue Abruf verlängert den Plan: "
+                   f"{euro(rate)} zusätzlich kosten etwa einen Monat mehr Rate.")
+        aus.append("")
+
+    aus.append("## Wiederkehrende Zahlungen")
+    aus.append("")
+    aus.append("| Gegenüber | Rhythmus | Betrag | im Jahr | zuletzt | nächste | Herkunft |")
+    aus.append("|---|---|---|---|---|---|---|")
+    faktor = {"monatlich": 12, "alle zwei Monate": 6, "vierteljährlich": 4, "halbjährlich": 2, "jährlich": 1}
+    for e in wk:
+        if not e["aktiv"]:
+            continue
+        naechste = next(termine(e, heute + timedelta(days=1), heute + timedelta(days=400)), None)
+        ende = f", endet {e['bis']:%m/%Y}" if e["bis"] else ""
+        aus.append(f"| {e['name']} | {e['rhythmus']} | {euro(e['betrag'])} | {euro(e['betrag'] * faktor[e['rhythmus']])} | "
+                   f"{e['letzte']:%d.%m.%Y} | {naechste:%d.%m.%Y} |" if naechste else
+                   f"| {e['name']} | {e['rhythmus']} | {euro(e['betrag'])} | {euro(e['betrag'] * faktor[e['rhythmus']])} | "
+                   f"{e['letzte']:%d.%m.%Y} | – |")
+        aus[-1] += f" {e['quelle']}{ende} |"
+    beendet = [e for e in wk if not e["aktiv"]]
+    if beendet:
+        aus.append("")
+        aus.append("Früher regelmäßig, zuletzt nicht mehr gebucht: " +
+                   "; ".join(f"{e['name']} ({e['rhythmus']}, {euro(e['betrag'])}, zuletzt {e['letzte']:%d.%m.%Y})" for e in beendet) + ".")
+    aus.append("")
+
+    # 3. Kontoverlauf
+    aus.append("## Kontoverlauf je Monat")
+    aus.append("")
+    aus.append("| Monat | Eingänge | Ausgänge | tiefster Stand | am | höchster Stand |")
+    aus.append("|---|---|---|---|---|---|")
+    jm = defaultdict(list)
+    for u in umsaetze:
+        jm[(u["datum"].year, u["datum"].month)].append(u)
+    for (j, m), liste in sorted(jm.items()):
+        tief = min(liste, key=lambda u: u["saldo"])
+        hoch = max(u["saldo"] for u in liste)
+        aus.append(f"| {MONATE[m - 1][:3]} {j} | {euro(sum(u['betrag'] for u in liste if u['betrag'] > 0))} | "
+                   f"{euro(sum(u['betrag'] for u in liste if u['betrag'] < 0))} | {euro(tief['saldo'])} | "
+                   f"{tief['datum']:%d.%m.} | {euro(hoch)} |")
+    aus.append("")
+
+    # 4. Kategorien
+    aus.append("## Ausgaben je Kategorie")
+    aus.append("")
+    letzte12 = sorted(jm)[-12:]
+    kats = defaultdict(lambda: defaultdict(float))
+    for (j, m) in letzte12:
+        for u in jm[(j, m)]:
+            if u["betrag"] < 0:
+                kats[u["kategorie"]][(j, m)] += u["betrag"]
+    kopf = "| Kategorie | " + " | ".join(f"{MONATE[m - 1][:3]} {str(j)[2:]}" for j, m in letzte12) + " | Summe |"
+    aus.append(kopf)
+    aus.append("|" + "---|" * (len(letzte12) + 2))
+    for k, werte in sorted(kats.items(), key=lambda kv: sum(kv[1].values())):
+        aus.append(f"| {k} | " + " | ".join(f"{-werte.get(x, 0):.0f}" for x in letzte12) +
+                   f" | {euro(sum(werte.values()))} |")
+    aus.append("")
+    aus.append("Beträge in Euro, Ausgaben positiv. Letzte Spalte über alle gezeigten Monate.")
+    aus.append("")
+
+    # 5. Ohne Kategorie
+    ohne = defaultdict(float)
+    anz = defaultdict(int)
+    for u in umsaetze:
+        if u["kategorie"] == "ohne Kategorie":
+            ohne[u["gegen"]] += u["betrag"]
+            anz[u["gegen"]] += 1
+    if ohne:
+        aus.append("## Ohne Kategorie")
+        aus.append("")
+        aus.append("Diese Gegenüber stehen noch in keiner Regel. Ein Eintrag in der Regeldatei ordnet sie zu.")
+        aus.append("")
+        for g, s in sorted(ohne.items(), key=lambda kv: kv[1])[:60]:
+            aus.append(f"- {g}: {anz[g]} Mal, {euro(s)}")
+        aus.append("")
+    if regeln.get("schlagworte"):
+        aus += ["", regeln["schlagworte"]]
+    return "\n".join(aus) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Kontoumsätze auswerten")
+    ap.add_argument("ordner")
+    ap.add_argument("--regeln")
+    ap.add_argument("--aus", required=True)
+    ap.add_argument("--monate", type=int, default=12)
+    ap.add_argument("--heute", help="Stichtag JJJJ-MM-TT, sonst der letzte Umsatz")
+    args = ap.parse_args()
+    regeln = regeln_lesen(args.regeln)
+    umsaetze = einlesen(args.ordner)
+    if not umsaetze:
+        sys.exit("Keine Umsätze gefunden.")
+    heute = date.fromisoformat(args.heute) if args.heute else umsaetze[-1]["datum"]
+    zuordnen(umsaetze, regeln)
+    wk = wiederkehrend(umsaetze, regeln, heute)
+    Path(args.aus).write_text(bericht(umsaetze, wk, regeln, args.monate, heute), encoding="utf-8")
+    print(f"{len(umsaetze)} Umsätze, {sum(1 for e in wk if e['aktiv'])} wiederkehrende Zahlungen. Bericht: {args.aus}")
+
+
+if __name__ == "__main__":
+    main()
