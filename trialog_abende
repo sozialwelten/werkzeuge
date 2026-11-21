@@ -29,7 +29,7 @@ from datetime import date, datetime, timedelta
 from pathlib import PurePosixPath
 
 KENNUNG = re.compile(r"∆(?:1|[A-Za-z]+)?_?(\d{6})(?:_(\d+\.\d+))?")
-ORDNER = re.compile(r"(?:∆(?:1|[A-Za-z]+)?_?)?(\d{6})(?:_(\d+\.\d+))?(?:_.+)?")
+ORDNER = re.compile(r"(?:∆(?:1|[A-Za-z]+)?_?)?(\d{6})(?:_(\d+[.-]\d+))?(?:_.+)?")
 DATUM = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
 NUMMER = re.compile(r"#(\d+)")
 WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -71,7 +71,7 @@ class Abende:
                  "quellen": set(), "hinweise": [], "weitere": set()}
             self.liste.append(a)
         a["zyklus"] = a["zyklus"] or zyklus
-        rang = 3 if quelle == "Liste" else (1 if zyklus else 0) + (1 if kennung.startswith("∆") else 0)
+        rang = 9 if quelle == "Liste" else (1 if zyklus else 0) + (1 if kennung.startswith("∆") else 0) + (1 if kennung.startswith("∆1_") else 0)
         if kennung and rang > a["rang"]:
             a["kennung"], a["rang"] = kennung, rang
         if weitere:
@@ -110,6 +110,53 @@ def liste_lesen(pfad, abende):
             a["hinweise"].append(f"Datum {d:%d.%m.%Y} in der Liste, Kennung sagt {kd:%d.%m.%Y}; Fotos werden an beiden Tagen gesucht")
 
 
+def zusammenfuehren(abende, ordner_von, fotozahl):
+    """Schlägt Abende, die nur aus Ordnernamen stammen, einem Nachbarn zu:
+    am selben Tag, mit gleichem Zyklus in derselben Woche, oder ohne Zyklus
+    und ohne eigene Fotos am Tag nach einem Abend."""
+    def nur_ordner(x):
+        return x["quellen"] == {"Ordner"}
+
+    def gewicht(x):
+        return ("Liste" in x["quellen"], fotozahl(x["datum"]), x["datum"].weekday() == 2, x["rang"])
+
+    geaendert = True
+    while geaendert:
+        geaendert = False
+        for src in list(abende.liste):
+            if not nur_ordner(src):
+                continue
+            kandidaten = []
+            for dst in abende.liste:
+                if dst is src:
+                    continue
+                abstand = (src["datum"] - dst["datum"]).days
+                if abstand == 0:
+                    kandidaten.append(dst)
+                elif src["zyklus"] and src["zyklus"] == dst["zyklus"] and abs(abstand) <= 7:
+                    kandidaten.append(dst)
+                elif not src["zyklus"] and abstand == 1 and fotozahl(src["datum"]) == 0:
+                    kandidaten.append(dst)
+            if not kandidaten:
+                continue
+            dst = max(kandidaten, key=gewicht)
+            if not nur_ordner(dst) or gewicht(dst) >= gewicht(src):
+                for k, v in ordner_von.items():
+                    if v is src:
+                        ordner_von[k] = dst
+                dst["quellen"] |= src["quellen"]
+                dst["zyklus"] = dst["zyklus"] or src["zyklus"]
+                if src["rang"] > dst["rang"]:
+                    dst["kennung"], dst["rang"] = src["kennung"], src["rang"]
+                if src["datum"] == dst["datum"]:
+                    dst["hinweise"].append(f"Ordner {src['kennung']} am selben Tag mit anderem Zyklus, zugeschlagen")
+                else:
+                    dst["hinweise"].append(f"Ordner {src['kennung']} trägt das Datum {src['datum']:%d.%m.%Y}, zugeschlagen")
+                abende.liste.remove(src)
+                geaendert = True
+                break
+
+
 def zeit(aufnahme):
     try:
         return datetime.strptime(aufnahme[:19], "%Y:%m:%d %H:%M:%S")
@@ -145,10 +192,27 @@ def main():
             if d:
                 schluessel = "/".join(teile[:i + 1])
                 if schluessel not in ordner_von:
-                    ordner_von[schluessel] = abende.add(d, m.group(2), teil, quelle="Ordner")
+                    z = m.group(2).replace("-", ".") if m.group(2) else None
+                    ordner_von[schluessel] = abende.add(d, z, teil, quelle="Ordner")
                 break
     if not abende.liste:
         sys.exit("keine Abende gefunden")
+
+    # Fotos: nur mit Kamera, ohne Scanner, gleiche Inhalte einmal
+    ohne = [k.lower() for k in a.ohne_kamera]
+    fotos = [(p, e, s, zeit(t), c) for p, e, s, t, c in zeilen
+             if t and c and not any(o in c.lower() for o in ohne)]
+    nach_tag = defaultdict(list)
+    for f in fotos:
+        if f[3]:
+            nach_tag[f[3].date()].append(f)
+
+    def im_fenster(d):
+        von = datetime.combine(d, datetime.min.time()) + timedelta(hours=12)
+        bis = von + timedelta(hours=18)
+        return [f for tag in (d, d + timedelta(days=1)) for f in nach_tag.get(tag, []) if von <= f[3] < bis]
+
+    zusammenfuehren(abende, ordner_von, lambda d: len({f[2] for f in im_fenster(d)}))
     abende.liste.sort(key=lambda x: (x["datum"], x["zyklus"] or ""))
 
     # Abendordner: jede Datei unter dem ersten Ordner mit Datum
@@ -161,25 +225,15 @@ def main():
                 ordner[id(ab)].append((p, e))
                 break
 
-    # Fotos: nur mit Kamera, ohne Scanner, gleiche Inhalte einmal
-    ohne = [k.lower() for k in a.ohne_kamera]
-    fotos = [(p, e, s, zeit(t), c) for p, e, s, t, c in zeilen
-             if t and c and not any(o in c.lower() for o in ohne)]
-    nach_tag = defaultdict(list)
-    for f in fotos:
-        if f[3]:
-            nach_tag[f[3].date()].append(f)
+    # Fotos je Abend
     zuordnung = defaultdict(list)
     belegte = set()
     for ab in abende.liste:
         for d in sorted({ab["datum"]} | ab["weitere"]):
-            von = datetime.combine(d, datetime.min.time()) + timedelta(hours=12)
-            bis = von + timedelta(hours=18)
-            for tag in (d, d + timedelta(days=1)):
-                for f in nach_tag.get(tag, []):
-                    if von <= f[3] < bis and f[2] not in belegte:
-                        belegte.add(f[2])
-                        zuordnung[id(ab)].append(f)
+            for f in im_fenster(d):
+                if f[2] not in belegte:
+                    belegte.add(f[2])
+                    zuordnung[id(ab)].append(f)
 
     # Scans
     scans = defaultdict(list)
@@ -215,10 +269,11 @@ def main():
     aus.append("")
     hinweise = [ab for ab in abende.liste if ab["hinweise"]]
     if hinweise:
-        aus.append("## Zu prüfen in der Liste")
+        aus.append("## Zu prüfen")
         aus.append("")
         for ab in hinweise:
-            aus.append(f"- {ab['datum']:%d.%m.%Y} {ab['kennung'] or ''} {ab['titel']}: " + "; ".join(ab["hinweise"]))
+            kopf = " ".join(x for x in (f"{ab['datum']:%d.%m.%Y}", ab["kennung"], ab["titel"]) if x)
+            aus.append(f"- {kopf}: " + "; ".join(ab["hinweise"]))
         aus.append("")
     aus.append("## Abende")
     aus.append("")
@@ -284,7 +339,7 @@ def main():
 
     mit_fotos = sum(1 for ab in abende.liste if zuordnung[id(ab)])
     print(f"{len(abende.liste)} Abende ({n_liste} aus der Liste), {mit_fotos} davon mit Fotos, "
-          f"{sum(1 for ab in abende.liste if scans.get(id(ab)))} mit Scans, {len(hinweise)} Hinweise zur Liste, "
+          f"{sum(1 for ab in abende.liste if scans.get(id(ab)))} mit Scans, {len(hinweise)} Hinweise, "
           f"{len(auffaellig)} auffällige Tage ohne Abend. Bericht: {a.aus}")
 
 
