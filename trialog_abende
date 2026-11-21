@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Katalog je Trialog-Abend.
+
+Ordnet jedem Abend die Dateien zu, die zu ihm gehören: Fotos aus dem
+Bestandskatalog von `bestand` (Aufnahmezeit zwischen 12 Uhr am Abend und
+6 Uhr am Morgen danach), den Abendordner mit der Kennung im Namen und die
+gescannten Blätter aus dem Scankatalog. Die Abende kommen aus den
+Abendordnern im Bestand und aus Markdown-Tabellen mit einer Spalte, die
+Kennungen der Form ∆1_JJMMTT_A.Z enthält.
+
+Der Bericht enthält nur Struktur und öffentliche Titel, keine Inhalte der
+Blätter. Wahlweise entsteht eine CSV mit allen zugeordneten Dateien.
+
+Lizenz: GPL-3.0-or-later
+"""
+import argparse
+import csv
+import re
+import sqlite3
+import sys
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+from pathlib import PurePosixPath
+
+KENNUNG = re.compile(r"∆1_(\d{2})(\d{2})(\d{2})_(\d+\.\d+)")
+DATUM = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
+WOCHENTAG = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+
+def aus_kennung(k):
+    m = KENNUNG.search(k)
+    if not m:
+        return None
+    jj, mm, tt, zyklus = m.groups()
+    try:
+        return date(2000 + int(jj), int(mm), int(tt)), zyklus, m.group(0)
+    except ValueError:
+        return None
+
+
+def abende_aus_liste(pfad):
+    """Liest Markdown-Tabellen und liefert {Kennung: {titel, ort}}."""
+    abende = {}
+    spalten = None
+    for zeile in open(pfad, encoding="utf-8"):
+        zeile = zeile.strip()
+        if not zeile.startswith("|"):
+            spalten = None
+            continue
+        zellen = [z.strip() for z in zeile.strip("|").split("|")]
+        if all(re.fullmatch(r":?-+:?", z) for z in zellen if z):
+            continue
+        if spalten is None and not KENNUNG.search(zeile):
+            spalten = [z.lower() for z in zellen]
+            continue
+        k = aus_kennung(zeile)
+        if not k:
+            continue
+        eintrag = {"titel": "", "ort": ""}
+        if spalten:
+            for name, wert in zip(spalten, zellen):
+                if name in eintrag:
+                    eintrag[name] = wert
+        abende[k[2]] = eintrag
+    return abende
+
+
+def zeit(aufnahme):
+    try:
+        return datetime.strptime(aufnahme[:19], "%Y:%m:%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def daten_im_text(text):
+    out = []
+    for t, m, j in DATUM.findall(text or ""):
+        try:
+            out.append(date(int(j), int(m), int(t)))
+        except ValueError:
+            pass
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Katalog je Trialog-Abend aus Bestand und Scankatalog")
+    ap.add_argument("--db", required=True, help="Bestandskatalog von bestand (SQLite)")
+    ap.add_argument("--katalog", help="Scankatalog als CSV mit den Spalten datei_id, kennung, datum_blatt, datum_erschlossen, dokumentart")
+    ap.add_argument("--liste", action="append", default=[], help="Markdown-Datei mit einer Tabelle der Abende, mehrfach möglich")
+    ap.add_argument("--aus", required=True, help="Bericht als Markdown")
+    ap.add_argument("--dateien", help="CSV mit allen zugeordneten Dateien")
+    ap.add_argument("--ohne-kamera", action="append", default=["oj_g510n"],
+                    help="Kameramodell, das nicht als Foto zählt, etwa ein Scanner; mehrfach möglich")
+    ap.add_argument("--schwelle", type=int, default=20, help="ab so vielen Fotos gilt ein Tag ohne Abend als auffällig")
+    a = ap.parse_args()
+
+    con = sqlite3.connect(a.db)
+    zeilen = con.execute("SELECT pfad, endung, sha256, aufnahme, kamera FROM datei").fetchall()
+
+    # Abende sammeln
+    abende = {}
+    for pfad, *_ in zeilen:
+        for teil in PurePosixPath(pfad).parts[:-1]:
+            k = aus_kennung(teil)
+            if k and KENNUNG.fullmatch(teil):
+                abende.setdefault(k[2], {"titel": "", "ort": "", "quelle": set()})["quelle"].add("Ordner")
+    for liste in a.liste:
+        for k, e in abende_aus_liste(liste).items():
+            ziel = abende.setdefault(k, {"titel": "", "ort": "", "quelle": set()})
+            ziel["titel"] = ziel["titel"] or e["titel"]
+            ziel["ort"] = ziel["ort"] or e["ort"]
+            ziel["quelle"].add("Liste")
+    if not abende:
+        sys.exit("keine Abende gefunden")
+    info = {k: aus_kennung(k) for k in abende}
+
+    # Fotos je Abend, ohne Scanner, Inhalte nur einmal
+    ohne = [k.lower() for k in a.ohne_kamera]
+    fotos = [(p, e, s, zeit(t), c) for p, e, s, t, c in zeilen
+             if t and not (c and any(o in c.lower() for o in ohne))]
+    nach_tag = defaultdict(list)
+    for f in fotos:
+        if f[3]:
+            nach_tag[f[3].date()].append(f)
+    zuordnung = defaultdict(list)
+    belegte = set()
+    for k, (d, _, _) in info.items():
+        von = datetime.combine(d, datetime.min.time()) + timedelta(hours=12)
+        bis = von + timedelta(hours=18)
+        gesehen = set()
+        for tag in (d, d + timedelta(days=1)):
+            for f in nach_tag.get(tag, []):
+                if von <= f[3] < bis and f[2] not in gesehen:
+                    gesehen.add(f[2])
+                    zuordnung[k].append(("Foto", f))
+                    belegte.add(f[2])
+
+    # Abendordner
+    ordner = defaultdict(list)
+    for p, e, s, t, c in zeilen:
+        for teil in PurePosixPath(p).parts[:-1]:
+            if teil in abende:
+                ordner[teil].append((p, e))
+                break
+
+    # Scans
+    scans = defaultdict(list)
+    if a.katalog:
+        for z in csv.DictReader(open(a.katalog, encoding="utf-8")):
+            daten = daten_im_text(z.get("datum_erschlossen")) or daten_im_text(z.get("datum_blatt"))
+            unsicher = bool(re.search(r"oder|vermut|\?", z.get("datum_erschlossen") or "", re.I))
+            zk = (z.get("kennung") or "").strip()
+            zk = aus_kennung(zk)[1] if aus_kennung(zk) else zk
+            for k, (d, zyklus, _) in info.items():
+                if d in daten or (not daten and zk and zk == zyklus):
+                    scans[k].append((z.get("datei_id", ""), z.get("dokumentart", ""), unsicher))
+
+    # Bericht
+    aus = [f"Stand: {date.today():%d.%m.%Y}. Katalog von {len(abende)} Trialog-Abenden, "
+           f"ermittelt aus {len(zeilen)} Dateien im Bestand"
+           + (" und dem Scankatalog." if a.katalog else "."), ""]
+    aus.append("Fotos zählen zu einem Abend, wenn sie zwischen 12 Uhr und 6 Uhr am Morgen danach aufgenommen sind. "
+               "Gleiche Inhalte zählen einmal. Scans gelten als unsicher, wenn ihr Datum nur vermutet ist.")
+    aus.append("")
+    aus.append("## Abende")
+    aus.append("")
+    aus.append("| Datum | Tag | Kennung | Titel | Ort | Fotos | RAW | Kameras | Fotos liegen in | Abendordner | Scans |")
+    aus.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for k in sorted(abende, key=lambda x: info[x][0]):
+        d = info[k][0]
+        fs = [f for _, f in zuordnung[k]]
+        raw = sum(1 for f in fs if (f[1] or "").lower() == ".cr2")
+        kameras = ", ".join(f"{c} {n}" for c, n in Counter(f[4] for f in fs if f[4]).most_common(2)) or "–"
+        orte = Counter(str(PurePosixPath(f[0]).parent) for f in fs).most_common(2)
+        orte = "; ".join(f"`{o}` {n}" for o, n in orte) or "–"
+        od = ordner.get(k, [])
+        tif = sum(1 for _, e in od if (e or "").lower() in (".tif", ".tiff"))
+        od_text = (f"{len(od)} {'Datei' if len(od) == 1 else 'Dateien'}" + (f", {tif} TIF" if tif else "")) if od else "–"
+        sc = scans.get(k, [])
+        sc_text = "–"
+        if sc:
+            arten = Counter(s[1] or "ohne Art" for s in sc).most_common(3)
+            sc_text = f"{len(sc)}: " + ", ".join(f"{x} {n}" for x, n in arten)
+            u = sum(1 for s in sc if s[2])
+            if u:
+                sc_text += f" ({u} unsicher)"
+        e = abende[k]
+        aus.append(f"| {d:%d.%m.%Y} | {WOCHENTAG[d.weekday()]} | {k} | {e['titel'] or '–'} | {e['ort'] or '–'} | "
+                   f"{len(fs) or '–'} | {raw or '–'} | {kameras} | {orte} | {od_text} | {sc_text} |")
+
+    # Aufnahmetage ohne Abend
+    rest = Counter()
+    for f in fotos:
+        if f[3] and f[2] not in belegte:
+            rest[(f[3] - timedelta(hours=6)).date()] += 1
+    auffaellig = sorted((d, n) for d, n in rest.items() if n > a.schwelle)
+    aus.append("")
+    aus.append("## Aufnahmetage ohne Abend")
+    aus.append("")
+    aus.append(f"Tage mit mehr als {a.schwelle} Fotos, die keinem Abend zugeordnet sind. Ein Tag reicht hier "
+               "von 6 Uhr bis 6 Uhr am nächsten Morgen. Kandidaten für fehlende Abende, aber auch Ausflüge, "
+               "Feiern oder Kameras mit falscher Uhr.")
+    aus.append("")
+    if auffaellig:
+        aus.append("| Datum | Tag | Fotos | Kameras | Fotos liegen in |")
+        aus.append("| --- | --- | --- | --- | --- |")
+        for d, n in auffaellig:
+            fs = [f for f in fotos if f[3] and f[2] not in belegte and (f[3] - timedelta(hours=6)).date() == d]
+            kameras = ", ".join(f"{c} {m}" for c, m in Counter(f[4] for f in fs if f[4]).most_common(2)) or "–"
+            orte = "; ".join(f"`{o}` {m}" for o, m in Counter(str(PurePosixPath(f[0]).parent) for f in fs).most_common(2))
+            aus.append(f"| {d:%d.%m.%Y} | {WOCHENTAG[d.weekday()]} | {n} | {kameras} | {orte} |")
+    else:
+        aus.append("Keine.")
+    open(a.aus, "w", encoding="utf-8").write("\n".join(aus) + "\n")
+
+    if a.dateien:
+        with open(a.dateien, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["kennung", "datum", "rolle", "pfad_oder_id", "zusatz"])
+            for k in sorted(abende, key=lambda x: info[x][0]):
+                d = f"{info[k][0]:%Y-%m-%d}"
+                for _, fo in zuordnung[k]:
+                    w.writerow([k, d, "foto", fo[0], fo[3].strftime("%H:%M")])
+                for p, _ in ordner.get(k, []):
+                    w.writerow([k, d, "abendordner", p, ""])
+                for sid, art, u in scans.get(k, []):
+                    w.writerow([k, d, "scan", sid, art + (" (unsicher)" if u else "")])
+
+    mit_fotos = sum(1 for k in abende if zuordnung[k])
+    print(f"{len(abende)} Abende, {mit_fotos} davon mit Fotos, {sum(1 for k in abende if scans.get(k))} mit Scans, "
+          f"{len(auffaellig)} auffällige Tage ohne Abend. Bericht: {a.aus}")
+
+
+if __name__ == "__main__":
+    main()

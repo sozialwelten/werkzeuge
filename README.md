@@ -5,6 +5,7 @@ Kleine Kommandozeilenwerkzeuge für den Alltag unter Linux.
 | Werkzeug | Zweck | Braucht |
 |---|---|---|
 | `bestand` | Bestandsaufnahme eines Archivordners: erfasst jede Datei mit Größe, SHA-256 und, wo vorhanden, Aufnahmedatum und Kamera in einer SQLite-Datei, schreibt einen Strukturbericht (Dateiarten, Zeiträume, RAW-JPG-Paare, Doppelungen innerhalb und zwischen Ordnern) und prüft andere Ordner gegen den Katalog. Ein abgebrochener Lauf macht beim nächsten Aufruf weiter. Aufruf siehe unten | `python3`, für die Aufnahmedaten `exiftool` (Paket `libimage-exiftool-perl`) |
+| `trialog_abende` | Katalog je Trialog-Abend: ordnet Fotos aus dem Katalog von `bestand`, Abendordner und gescannte Blätter den Abenden zu und listet Tage mit vielen Fotos, die keinem Abend zugeordnet sind. Aufruf siehe unten | `python3` |
 | `obsidian_ordnen` | benennt und verschiebt Notizen eines Obsidian-Vaults nach einer Plan-Datei, zieht dabei alle Links nach, wandelt YAML-Köpfe in eine schlichte Zeile um und setzt Hashtags. Zeigt ohne `--ausfuehren` nur an, was geschehen würde, und legt vor dem Ausführen eine Sicherung an. Aufruf siehe unten | `python3` |
 | `kontoauswertung` | wertet CSV-Exporte eines Girokontos (Santander/Openbank) aus: erkennt wiederkehrende Zahlungen und zeigt jede im Monat ihrer tatsächlichen Fälligkeit, auch jährliche, rechnet den Kontostand für die kommenden Monate voraus und liefert Tilgungspläne, Kontoverlauf, Ausgaben je Kategorie und nicht zugeordnete Zahlungen. Persönliche Zuordnungen stehen in einer eigenen Regeldatei, ein Muster liegt als `regeln.beispiel.toml` bei. Aufruf siehe unten | `python3` ab 3.11 |
 | `notiz` | liest, legt an und ändert Notizen in einem Obsidian-Vault, Text über die Standardeingabe. Gedacht für die Arbeit mit einer Assistenz im Chat: Sie gibt fertige Befehle, der Mensch führt sie aus. `karte` zeigt alle Notizen mit Stand und erstem Satz, `zeige --kopieren` legt Notizen in die Zwischenablage. Vor jeder Änderung eine Sicherung. Aufruf siehe unten | `python3`, für `--kopieren` `wl-copy` (Paket `wl-clipboard`) oder `xclip` |
@@ -55,6 +56,12 @@ Kleine Shell-Aliase, die auf allen Rechnern gelten sollen. Einbinden mit einer Z
 
 Gebraucht werden je nach Alias `nmcli`, `cava`, `arecord`, `toot` und `play` (Paket `sox`).
 
+## trialog_abende
+
+    trialog_abende --db bestand.sqlite --aus abende.md [--katalog scans.csv] [--liste abende.md] [--dateien zuordnung.csv]
+
+Abende kommen aus Ordnern, deren Name eine Kennung der Form `∆1_JJMMTT_A.Z` ist, und aus Markdown-Tabellen mit solchen Kennungen; `--liste` lässt sich mehrfach angeben. Fotos zählen zu einem Abend, wenn sie zwischen 12 Uhr und 6 Uhr am Morgen danach aufgenommen sind, gleiche Inhalte einmal. Scanner nimmt `--ohne-kamera` aus, voreingestellt ist `oj_g510n`. Aus einem Scankatalog kommen Blätter mit passendem Datum oder passender Kennung dazu, vermutete Daten werden als unsicher markiert. Der Bericht enthält nur Struktur und Titel. `--dateien` schreibt alle Zuordnungen als CSV.
+
 ## Einrichtung
 
     git clone git@github.com:sozialwelten/werkzeuge.git
@@ -68,4 +75,4 @@ Neue Werkzeuge: Datei ohne Endung in diesen Ordner legen, mit `chmod +x` ausfüh
 ## Lizenz
 
 - `pdf_reduktion`: shrinkpdf von Alfred Klomp, angepasst von Vivek Gite, BSD-3-Clause (Lizenztext in der Datei)
-- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `notiz`, `cr2`, `einrichten`, `aliase`: GPL-3.0-or-later, Lizenztext in `LICENSE`
+- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `notiz`, `cr2`, `einrichten`, `aliase`, `trialog_abende`: GPL-3.0-or-later, Lizenztext in `LICENSE`
