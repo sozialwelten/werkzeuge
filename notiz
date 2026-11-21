@@ -227,6 +227,9 @@ def aendere(v, name):
     vorher = p.read_text(encoding="utf-8")
     text = vorher
     for i, (alt, neu_) in enumerate(bloecke, 1):
+        alt, neu_ = alt.removesuffix("\n"), neu_.removesuffix("\n")
+        if not alt:
+            fehler(f"Block {i}: der alte Text ist leer, nichts geändert")
         n = text.count(alt)
         if n != 1:
             anfang = alt.strip().splitlines()[0][:60] if alt.strip() else "(leer)"
