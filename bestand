@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Bestandsaufnahme eines Archivordners.
+
+Erfasst jede Datei mit Größe, Änderungszeit, SHA-256 und, wo vorhanden,
+Aufnahmedatum und Kamera aus den Metadaten (über exiftool). Alles landet
+in einer SQLite-Datei. Ein zweiter Lauf erfasst nur, was neu ist oder sich
+geändert hat, ein Abbruch kostet also nichts.
+
+Der Bericht enthält nur Struktur: Ordner, Zahlen, Dateiarten, Zeiträume,
+Doppelungen. Inhalte von Dateien werden nie ausgegeben.
+
+  bestand erfassen  WURZEL --db KATALOG.sqlite
+  bestand bericht   --db KATALOG.sqlite --aus BERICHT.md [--tiefe 2]
+  bestand vergleich WURZEL --db KATALOG.sqlite --aus VERGLEICH.md
+
+Lizenz: GPL-3.0-or-later
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+BLOCK = 16 * 1024 * 1024
+BILDARTEN = {".jpg", ".jpeg", ".cr2", ".png", ".tif", ".tiff", ".heic",
+             ".mov", ".mp4", ".avi", ".mts", ".m4v", ".gif", ".dng"}
+
+
+def db_oeffnen(pfad):
+    con = sqlite3.connect(pfad)
+    con.execute("""CREATE TABLE IF NOT EXISTS datei (
+        pfad TEXT PRIMARY KEY, groesse INTEGER, mtime REAL, endung TEXT,
+        sha256 TEXT, aufnahme TEXT, kamera TEXT, exif_geprueft INTEGER DEFAULT 0)""")
+    con.execute("CREATE INDEX IF NOT EXISTS i_sha ON datei(sha256)")
+    return con
+
+
+def pruefsumme(pfad):
+    h = hashlib.sha256()
+    with open(pfad, "rb") as f:
+        while True:
+            b = f.read(BLOCK)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def dateien(wurzel):
+    for ordner, unter, namen in os.walk(wurzel):
+        unter.sort()
+        for n in sorted(namen):
+            p = Path(ordner) / n
+            if p.is_symlink() or not p.is_file():
+                continue
+            yield p
+
+
+def fortschritt(text):
+    sys.stderr.write("\r" + text[:150].ljust(150))
+    sys.stderr.flush()
+
+
+def erfassen(args):
+    wurzel = Path(args.wurzel).resolve()
+    con = db_oeffnen(args.db)
+    bekannt = {p: (g, m) for p, g, m in con.execute("SELECT pfad, groesse, mtime FROM datei")}
+    gesehen = set()
+    zu_tun = []
+    gesamt = 0
+    for p in dateien(wurzel):
+        rel = str(p.relative_to(wurzel))
+        st = p.stat()
+        gesehen.add(rel)
+        if bekannt.get(rel) == (st.st_size, st.st_mtime):
+            continue
+        zu_tun.append((rel, st.st_size, st.st_mtime))
+        gesamt += st.st_size
+    weg = set(bekannt) - gesehen
+    for rel in weg:
+        con.execute("DELETE FROM datei WHERE pfad=?", (rel,))
+    print(f"{len(gesehen)} Dateien, davon {len(zu_tun)} zu erfassen "
+          f"({gesamt / 1e9:.1f} GB), {len(weg)} nicht mehr vorhanden", file=sys.stderr)
+
+    erledigt = 0
+    start = time.time()
+    for i, (rel, groesse, mtime) in enumerate(zu_tun, 1):
+        try:
+            sha = pruefsumme(wurzel / rel)
+        except OSError as e:
+            print(f"\nNicht lesbar: {rel}: {e}", file=sys.stderr)
+            continue
+        con.execute("""INSERT OR REPLACE INTO datei (pfad, groesse, mtime, endung, sha256,
+                       aufnahme, kamera, exif_geprueft) VALUES (?,?,?,?,?,NULL,NULL,0)""",
+                    (rel, groesse, mtime, Path(rel).suffix.lower(), sha))
+        erledigt += groesse
+        if i % 200 == 0:
+            con.commit()
+        if i % 20 == 0 or i == len(zu_tun):
+            dauer = time.time() - start
+            rate = erledigt / dauer / 1e6 if dauer else 0
+            rest = (gesamt - erledigt) / (rate * 1e6) / 60 if rate else 0
+            fortschritt(f"Prüfsummen {i}/{len(zu_tun)}  {erledigt / 1e9:.1f}/{gesamt / 1e9:.1f} GB  "
+                        f"{rate:.0f} MB/s  noch etwa {rest:.0f} min")
+    con.commit()
+    print(file=sys.stderr)
+    metadaten(con, wurzel)
+    con.close()
+
+
+def metadaten(con, wurzel):
+    if not shutil.which("exiftool"):
+        print("exiftool fehlt, Aufnahmedaten werden übersprungen "
+              "(sudo apt install libimage-exiftool-perl)", file=sys.stderr)
+        return
+    offen = [r[0] for r in con.execute(
+        "SELECT pfad FROM datei WHERE exif_geprueft=0 AND endung IN (%s)"
+        % ",".join("?" * len(BILDARTEN)), sorted(BILDARTEN))]
+    print(f"Metadaten für {len(offen)} Bild- und Videodateien", file=sys.stderr)
+    for i in range(0, len(offen), 500):
+        teil = offen[i:i + 500]
+        liste = "\n".join(teil) + "\n"
+        r = subprocess.run(
+            ["exiftool", "-j", "-q", "-q", "-fast2", "-charset", "filename=utf8",
+             "-DateTimeOriginal", "-CreateDate", "-Model", "-@", "-"],
+            input=liste.encode(), capture_output=True, cwd=wurzel)
+        try:
+            daten = json.loads(r.stdout or b"[]")
+        except json.JSONDecodeError:
+            daten = []
+        gefunden = {}
+        for d in daten:
+            datum = d.get("DateTimeOriginal") or d.get("CreateDate")
+            if isinstance(datum, str) and datum.startswith("0000"):
+                datum = None
+            gefunden[d.get("SourceFile")] = (datum, d.get("Model"))
+        for rel in teil:
+            datum, kamera = gefunden.get(rel, (None, None))
+            con.execute("UPDATE datei SET aufnahme=?, kamera=?, exif_geprueft=1 WHERE pfad=?",
+                        (datum, kamera, rel))
+        con.commit()
+        fortschritt(f"Metadaten {min(i + 500, len(offen))}/{len(offen)}")
+    print(file=sys.stderr)
+
+
+def gb(b):
+    if b >= 1e9:
+        return f"{b / 1e9:.1f} GB"
+    if b >= 1e6:
+        return f"{b / 1e6:.0f} MB"
+    return f"{b / 1e3:.0f} KB"
+
+
+def jahr_monat(aufnahme, mtime):
+    if aufnahme and len(aufnahme) >= 7 and aufnahme[:4].isdigit():
+        return aufnahme[:7].replace(":", "-"), True
+    return time.strftime("%Y-%m", time.localtime(mtime)), False
+
+
+def bereich(werte):
+    if not werte:
+        return "–"
+    a, b = min(werte), max(werte)
+    return a if a == b else f"{a} bis {b}"
+
+
+def zeile(*spalten):
+    return "| " + " | ".join(str(s) for s in spalten) + " |"
+
+
+def bericht(args):
+    con = db_oeffnen(args.db)
+    rows = con.execute("SELECT pfad, groesse, mtime, endung, sha256, aufnahme, kamera FROM datei").fetchall()
+    tiefe = args.tiefe
+
+    def gruppe(pfad, t):
+        teile = Path(pfad).parts[:-1]
+        return "/".join(teile[:t]) if teile else "(oberste Ebene)"
+
+    nach_sha = defaultdict(list)
+    for r in rows:
+        nach_sha[r[4]].append(r)
+    doppelt = {s: g for s, g in nach_sha.items() if len(g) > 1}
+
+    aus = []
+    gesamt = sum(r[1] for r in rows)
+    ueberzaehlig = sum(g[0][1] * (len(g) - 1) for g in doppelt.values())
+    aus.append(f"Bestandsaufnahme, erstellt {time.strftime('%d.%m.%Y %H:%M')}")
+    aus.append("")
+    aus.append(f"{len(rows)} Dateien, {gb(gesamt)}. Davon {len(doppelt)} Inhalte mehrfach vorhanden, "
+               f"zusammen {sum(len(g) - 1 for g in doppelt.values())} überzählige Kopien mit {gb(ueberzaehlig)}.")
+    aus.append("")
+    aus.append("Zeiträume aus den Kameradaten, wo vorhanden. Sonst aus dem Änderungsdatum der Datei, "
+               "das bei Kopien oft das Kopierdatum ist; solche Angaben sind mit * markiert.")
+    aus.append("")
+
+    for t in range(1, tiefe + 1):
+        aus.append(f"## Ordner, Ebene {t}")
+        aus.append("")
+        aus.append(zeile("Ordner", "Dateien", "Größe", "Arten", "Zeitraum", "Kameras", "RAW+JPG-Paare", "doppelt innerhalb", "doppelt anderswo"))
+        aus.append(zeile(*["---"] * 9))
+        nach_ordner = defaultdict(list)
+        for r in rows:
+            nach_ordner[gruppe(r[0], t)].append(r)
+        for ordner in sorted(nach_ordner):
+            g = nach_ordner[ordner]
+            arten = Counter(r[3] or "(ohne)" for r in g).most_common(5)
+            exif, datei = [], []
+            for r in g:
+                jm, echt = jahr_monat(r[5], r[2])
+                (exif if echt else datei).append(jm)
+            zeitraum = bereich(exif) if exif else (bereich(datei) + " *" if datei else "–")
+            kameras = Counter(r[6] for r in g if r[6]).most_common(3)
+            stems = defaultdict(set)
+            for r in g:
+                p = Path(r[0])
+                stems[(str(p.parent), p.stem.lower())].add(r[3])
+            paare = sum(1 for e in stems.values() if ".cr2" in e and (".jpg" in e or ".jpeg" in e))
+            shas = Counter(r[4] for r in g)
+            innen = sum(n - 1 for n in shas.values() if n > 1)
+            aussen = sum(1 for s in shas if len(nach_sha[s]) > shas[s])
+            aus.append(zeile(ordner, len(g), gb(sum(r[1] for r in g)),
+                             ", ".join(f"{e} {n}" for e, n in arten),
+                             zeitraum, ", ".join(f"{k} {n}" for k, n in kameras) or "–",
+                             paare or "–", innen or "–", aussen or "–"))
+        aus.append("")
+
+    aus.append("## Welche Ordner sich Inhalte teilen")
+    aus.append("")
+    aus.append("Gleiche Dateien in zwei verschiedenen Ordnern der Ebene 1, nach überzähliger Größe sortiert.")
+    aus.append("")
+    paar = defaultdict(lambda: [0, 0])
+    for g in doppelt.values():
+        orte = sorted({gruppe(r[0], 1) for r in g})
+        for i in range(len(orte)):
+            for j in range(i + 1, len(orte)):
+                paar[(orte[i], orte[j])][0] += 1
+                paar[(orte[i], orte[j])][1] += g[0][1]
+    aus.append(zeile("Ordner A", "Ordner B", "gemeinsame Dateien", "Größe"))
+    aus.append(zeile(*["---"] * 4))
+    for (a, b), (n, s) in sorted(paar.items(), key=lambda x: -x[1][1])[:40]:
+        aus.append(zeile(a, b, n, gb(s)))
+    aus.append("")
+
+    aus.append("## Größte Doppelungen")
+    aus.append("")
+    groesste = sorted(doppelt.values(), key=lambda g: -g[0][1] * (len(g) - 1))[:args.beispiele]
+    for g in groesste:
+        aus.append(f"- {gb(g[0][1])}, {len(g)} mal: " + "; ".join(sorted(r[0] for r in g)))
+    aus.append("")
+
+    aus.append("## Dateiarten insgesamt")
+    aus.append("")
+    aus.append(zeile("Endung", "Dateien", "Größe"))
+    aus.append(zeile(*["---"] * 3))
+    arten = defaultdict(lambda: [0, 0])
+    for r in rows:
+        arten[r[3] or "(ohne)"][0] += 1
+        arten[r[3] or "(ohne)"][1] += r[1]
+    for e, (n, s) in sorted(arten.items(), key=lambda x: -x[1][1]):
+        aus.append(zeile(e, n, gb(s)))
+    aus.append("")
+
+    aus.append("## Aufnahmen nach Monat")
+    aus.append("")
+    aus.append("Nur Dateien mit Kameradaten. Hilft, Abende zu finden: ein Trialog zeigt sich als Häufung an einem Tag.")
+    aus.append("")
+    tage = Counter()
+    for r in rows:
+        if r[5] and r[5][:4].isdigit():
+            tage[r[5][:10].replace(":", "-")] += 1
+    monate = Counter()
+    for t, n in tage.items():
+        monate[t[:7]] += n
+    aus.append(zeile("Monat", "Aufnahmen", "Tage mit mehr als 20 Aufnahmen"))
+    aus.append(zeile(*["---"] * 3))
+    for m in sorted(monate):
+        viele = [t[8:] for t, n in sorted(tage.items()) if t.startswith(m) and n > 20]
+        aus.append(zeile(m, monate[m], ", ".join(viele) or "–"))
+    aus.append("")
+
+    Path(args.aus).write_text("\n".join(aus), encoding="utf-8")
+    print(f"Bericht: {args.aus}", file=sys.stderr)
+
+
+def vergleich(args):
+    wurzel = Path(args.wurzel).resolve()
+    con = db_oeffnen(args.db)
+    im_katalog = defaultdict(list)
+    for p, s in con.execute("SELECT pfad, sha256 FROM datei"):
+        im_katalog[s].append(p)
+    gleich, fehlt = [], []
+    liste = list(dateien(wurzel))
+    for i, p in enumerate(liste, 1):
+        s = pruefsumme(p)
+        rel = str(p.relative_to(wurzel))
+        (gleich if s in im_katalog else fehlt).append((rel, p.stat().st_size, im_katalog.get(s, [])))
+        if i % 20 == 0 or i == len(liste):
+            fortschritt(f"Vergleich {i}/{len(liste)}")
+    print(file=sys.stderr)
+    aus = [f"Vergleich von {wurzel} mit dem Katalog, erstellt {time.strftime('%d.%m.%Y %H:%M')}", "",
+           f"{len(liste)} Dateien. {len(gleich)} davon sind inhaltsgleich im Katalog vorhanden, "
+           f"{len(fehlt)} fehlen dort ({gb(sum(f[1] for f in fehlt))}).", ""]
+    aus.append("## Fehlen im Katalog")
+    aus.append("")
+    for rel, groesse, _ in fehlt:
+        aus.append(f"- {rel} ({gb(groesse)})")
+    aus.append("")
+    aus.append("## Im Katalog vorhanden, nach Ordner")
+    aus.append("")
+    orte = Counter()
+    for rel, _, ziel in gleich:
+        orte[(str(Path(rel).parent), str(Path(ziel[0]).parent))] += 1
+    for (a, b), n in sorted(orte.items()):
+        aus.append(f"- {a} → {b}: {n}")
+    Path(args.aus).write_text("\n".join(aus), encoding="utf-8")
+    print(f"Vergleich: {args.aus}", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Bestandsaufnahme eines Archivordners")
+    sub = ap.add_subparsers(dest="befehl", required=True)
+    e = sub.add_parser("erfassen", help="Prüfsummen und Metadaten in den Katalog")
+    e.add_argument("wurzel")
+    e.add_argument("--db", required=True)
+    b = sub.add_parser("bericht", help="Strukturbericht als Markdown")
+    b.add_argument("--db", required=True)
+    b.add_argument("--aus", required=True)
+    b.add_argument("--tiefe", type=int, default=2)
+    b.add_argument("--beispiele", type=int, default=30)
+    v = sub.add_parser("vergleich", help="anderen Ordner gegen den Katalog prüfen")
+    v.add_argument("wurzel")
+    v.add_argument("--db", required=True)
+    v.add_argument("--aus", required=True)
+    args = ap.parse_args()
+    {"erfassen": erfassen, "bericht": bericht, "vergleich": vergleich}[args.befehl](args)
+
+
+if __name__ == "__main__":
+    main()
