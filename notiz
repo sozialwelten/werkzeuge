@@ -95,8 +95,11 @@ def pruefen(text, pfad):
     zeilen = text.splitlines()
     if zeilen and zeilen[0].strip() == "---":
         hinweise.append("beginnt mit einem YAML-Kopf, laut Vault-Konventionen nicht erwünscht")
-    if not zeilen or not zeilen[0].startswith("# "):
-        hinweise.append("erste Zeile ist keine Überschrift „# Titel“")
+    erste = next((z for z in zeilen if z.strip()), "")
+    if erste.startswith("# "):
+        hinweise.append("beginnt mit einer Überschrift, Obsidian zeigt den Dateinamen schon als Titel")
+    elif not re.match(r"\**(Stand|Vertraulich)\b", erste):
+        hinweise.append("erste Zeile ist weder „Stand:“ noch „Vertraulich:“")
     letzte = next((z for z in reversed(zeilen) if z.strip()), "")
     if not re.fullmatch(r"\s*(#[^\s#]+\s*)+", letzte):
         hinweise.append("letzte Zeile enthält keine Hashtags")

@@ -3,8 +3,7 @@
 # Ein vorangestelltes "+:" oder "-:" lässt eine Regel nur für Eingänge
 # bzw. nur für Ausgänge gelten.
 
-# Überschrift und Schlagworte (z. B. Obsidian-Hashtags) für den Bericht, beides optional
-titel = "Kontoauswertung"
+# Schlagworte (z. B. Obsidian-Hashtags) für die letzte Zeile des Berichts, optional
 schlagworte = "#Finanzen"
 
 # Gegenüber, die nie als wiederkehrend gelten sollen, auch wenn sie oft vorkommen

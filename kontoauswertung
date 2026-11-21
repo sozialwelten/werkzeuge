@@ -220,7 +220,7 @@ def termine(e, von, bis):
 
 
 def bericht(umsaetze, wk, regeln, monate, heute):
-    aus = [f"# {regeln.get('titel', 'Kontoauswertung')}", ""]
+    aus = []
     erster, letzter = umsaetze[0]["datum"], umsaetze[-1]["datum"]
     stand = umsaetze[-1]["saldo"]
     aus.append(f"Stand: {date.today():%d.%m.%Y}. Ausgewertet sind {len(umsaetze)} Umsätze vom {erster:%d.%m.%Y} bis {letzter:%d.%m.%Y}. "
