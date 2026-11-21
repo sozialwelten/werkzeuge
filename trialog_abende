@@ -172,7 +172,7 @@ def website_lesen(ordner, abende):
         slug_funde = list(KENNUNG.finditer(slug_punkt))
         titel_daten = daten_im_text(titel)
         eintraege = []
-        if not funde and titel_daten and 0 <= (pub - titel_daten[0]).days <= 21:
+        if not funde and titel_daten and -3 <= (pub - titel_daten[0]).days <= 21:
             d = titel_daten[0]
             sd = jjmmtt(slug_funde[0].group(2)) if slug_funde else None
             zyklus = slug_funde[0].group(3) if slug_funde and sd == d else None
@@ -185,9 +185,9 @@ def website_lesen(ordner, abende):
         for i, (m, woher) in enumerate(funde):
             d = jjmmtt(m.group(2))
             hinweis = None
-            if d is None or not 0 <= (pub - d).days <= 21:
+            if d is None or not -3 <= (pub - d).days <= 21:
                 alt = jjmmtt(slug_funde[i].group(2)) if i < len(slug_funde) else None
-                if alt and 0 <= (pub - alt).days <= 21:
+                if alt and -3 <= (pub - alt).days <= 21:
                     hinweis = f"Website: {woher} nennt {m.group(0)}, Adresse {slug_funde[i].group(0)}"
                     d = alt
                 elif d:
@@ -195,7 +195,7 @@ def website_lesen(ordner, abende):
                         neu = d.replace(year=pub.year)
                     except ValueError:
                         neu = None
-                    if neu and 0 <= (pub - neu).days <= 21:
+                    if neu and -3 <= (pub - neu).days <= 21:
                         hinweis = f"Website: Kennung {m.group(0)} mit falschem Jahr, veröffentlicht {pub:%d.%m.%Y}"
                         d = neu
                     else:
@@ -223,8 +223,8 @@ def zusammenfuehren(abende, ordner_von, fotozahl):
         return "Liste" not in x["quellen"]
 
     def gewicht(x):
-        return ("Liste" in x["quellen"], "Website" in x["quellen"], fotozahl(x["datum"]),
-                x["datum"].weekday() == 2, x["rang"])
+        return ("Liste" in x["quellen"], fotozahl(x["datum"]) > 0, "Website" in x["quellen"],
+                fotozahl(x["datum"]), x["datum"].weekday() == 2, x["rang"])
 
     def gleiche_serie(a, b):
         return not a["serie"] or not b["serie"] or a["serie"] == b["serie"]
@@ -261,7 +261,7 @@ def zusammenfuehren(abende, ordner_von, fotozahl):
             dst["weitere"] |= src["weitere"]
             for k in ("titel", "ort", "link", "nr", "web_nr"):
                 dst[k] = dst[k] or src[k]
-            if src["rang"] > dst["rang"]:
+            if src["rang"] > dst["rang"] and src["datum"] == dst["datum"]:
                 dst["kennung"], dst["rang"] = src["kennung"], src["rang"]
             herkunft = "Website-Beitrag" if "Website" in src["quellen"] else "Ordner"
             if src["datum"] == dst["datum"]:
@@ -344,7 +344,10 @@ def main():
 
     zuordnung = defaultdict(list)
     belegte = set()
-    for ab in abende.liste:
+    def vorrang(ab):
+        return ("Ordner" not in ab["quellen"], ab["serie"] not in (None, "∆1"), ab["datum"])
+
+    for ab in sorted(abende.liste, key=vorrang):
         for d in sorted({ab["datum"]} | ab["weitere"]):
             for f in im_fenster(d):
                 if f[2] not in belegte:
@@ -426,7 +429,7 @@ def main():
             u = sum(1 for s in sc if s[2])
             if u:
                 sc_text += f" ({u} unsicher)"
-        titel = NUMMER.sub("", ab["titel"]).strip() or "–"
+        titel = NUMMER.sub("", ab["titel"]).strip() or ("Schabbat" if "schabbat" in ab["kennung"].lower() else "–")
         quelle = "".join(q for q in ("L", "W", "O") if {"L": "Liste", "W": "Website", "O": "Ordner"}[q] in ab["quellen"])
         aus.append(f"| {d:%d.%m.%Y} | {WOCHENTAG[d.weekday()]} | {ab['kennung'] or '–'} | {ab['nr'] or '–'} | {titel} | "
                    f"{ab['ort'] or '–'} | {quelle} | {len(fs) or '–'} | {raw or '–'} | {kameras} | {orte} | {od_text} | {sc_text} |")
