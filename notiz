@@ -2,8 +2,8 @@
 """Notizen in einem Obsidian-Vault lesen, anlegen und ändern, ohne Dateien hin- und herzukopieren.
 
 Gedacht für die Arbeit mit einer Assistenz im Chat: Die Assistenz gibt einen fertigen
-Befehl, der Mensch fügt ihn ins Terminal ein. Neuer oder geänderter Text kommt über
-die Standardeingabe, meist als Heredoc.
+Befehl, der Mensch fügt ihn ins Terminal ein. Neuer oder geänderter Text kommt aus der
+Zwischenablage (-z) oder über die Standardeingabe, etwa als Heredoc.
 
   notiz liste [ORDNER]          alle Notizen, auf Wunsch nur in einem Ordner
   notiz karte [ORDNER]          alle Notizen mit Stand-Datum und erstem Satz
@@ -20,6 +20,14 @@ die Standardeingabe, meist als Heredoc.
                                     @@@ ende
                                 Jeder alte Text muss genau einmal vorkommen, sonst
                                 ändert sich nichts. Mehrere Blöcke nacheinander sind möglich.
+
+Optionen für neu, ersetze und aendere:
+  -z, --zwischenablage          Text aus der Zwischenablage statt aus der Standardeingabe.
+                                Erst den Befehl starten, dann den Inhalt kopieren und Enter
+                                drücken. Danach zeigt notiz eine Prüfung und fragt, ob es
+                                schreiben soll.
+  --probe                       nur prüfen und die Übersicht zeigen, nichts schreiben.
+                                Geht mit der Standardeingabe und mit -z.
 
 NAME ist der Dateiname ohne .md, etwa "Finanzen", oder ein Pfad im Vault,
 etwa "Verwaltung/Finanzen". Der Vault steht in der Umgebungsvariablen OBSIDIAN_VAULT.
@@ -81,13 +89,65 @@ def finden(v, name):
     return treffer[0]
 
 
-def eingabe():
-    if sys.stdin.isatty():
-        fehler("kein Text über die Standardeingabe, etwa mit <<'ENDE' … ENDE")
-    text = sys.stdin.read()
+def ablage_lesen():
+    for befehl in (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"],
+                   ["xsel", "--clipboard", "--output"]):
+        if shutil.which(befehl[0]):
+            r = subprocess.run(befehl, capture_output=True)
+            return r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else ""
+    fehler("kein Programm für die Zwischenablage gefunden. Unter Wayland: sudo apt install wl-clipboard")
+
+
+def frage(text):
+    print(text, end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        fehler("abgebrochen, nichts geändert")
+
+
+def eingabe(z=False):
+    if z:
+        while True:
+            frage("Inhalt jetzt in die Zwischenablage kopieren, dann Enter (Abbruch mit Strg+C) ")
+            text = ablage_lesen().replace("\r\n", "\n")
+            if not text.strip():
+                print("Die Zwischenablage ist leer. Bitte den Inhalt kopieren.", file=sys.stderr)
+            elif re.match(r"\s*(export |notiz |wl-paste)", text):
+                print("In der Zwischenablage steht noch der Befehl. Bitte den Inhaltsblock kopieren.", file=sys.stderr)
+            else:
+                text = text.lstrip("\n")
+                break
+    else:
+        if sys.stdin.isatty():
+            fehler("kein Text über die Standardeingabe, etwa mit <<'ENDE' … ENDE, oder -z für die Zwischenablage")
+        text = sys.stdin.read()
     if not text.strip():
         fehler("die Eingabe ist leer, nichts geändert")
     return text if text.endswith("\n") else text + "\n"
+
+
+def bestaetigen(probe, z):
+    """True, wenn geschrieben werden soll."""
+    if probe:
+        print("Probe: nichts geschrieben.")
+        return False
+    if z and frage("Schreiben? [j/N] ").lower() not in ("j", "ja", "y"):
+        print("Nicht geschrieben.")
+        return False
+    return True
+
+
+def uebersicht(text, p, vorher=None):
+    zeilen = text.splitlines()
+    erste = next((x for x in zeilen if x.strip()), "")
+    letzte = next((x for x in reversed(zeilen) if x.strip()), "")
+    art = "neu" if vorher is None else f"ersetzt, vorher {len(vorher.splitlines())} Zeilen"
+    print(f"Ziel: {p} ({art})")
+    print(f"Zeilen: {len(zeilen)}")
+    print(f"Erste Zeile: {erste[:100]}")
+    print(f"Letzte Zeile: {letzte[:100]}")
 
 
 def pruefen(text, pfad):
@@ -105,6 +165,7 @@ def pruefen(text, pfad):
         hinweise.append("letzte Zeile enthält keine Hashtags")
     for h in hinweise:
         print(f"Hinweis zu {pfad.name}: {h}", file=sys.stderr)
+    return hinweise
 
 
 def sichern(p):
@@ -194,7 +255,7 @@ def zeige(v, namen, kopieren=False):
         sys.stdout.write(text)
 
 
-def neu(v, pfad):
+def neu(v, pfad, z=False, probe=False):
     pfad = pfad.removesuffix(".md")
     p = v / (pfad + ".md")
     if UNERLAUBT.search(p.stem):
@@ -206,41 +267,60 @@ def neu(v, pfad):
     gleich = [q for q in alle(v) if q.stem == p.stem]
     if gleich:
         fehler(f"der Name „{p.stem}“ ist schon vergeben: {gleich[0].relative_to(v)}")
-    text = eingabe()
+    text = eingabe(z)
+    if z or probe:
+        uebersicht(text, p)
     pruefen(text, p)
-    schreiben(p, text)
+    if bestaetigen(probe, z):
+        schreiben(p, text)
 
 
-def ersetze(v, name):
+def ersetze(v, name, z=False, probe=False):
     p = finden(v, name)
-    text = eingabe()
+    text = eingabe(z)
     vorher = p.read_text(encoding="utf-8")
+    if z or probe:
+        uebersicht(text, p, vorher)
     pruefen(text, p)
-    s = sichern(p)
-    schreiben(p, text, vorher)
-    print(f"Sicherung: {s}")
+    if bestaetigen(probe, z):
+        s = sichern(p)
+        schreiben(p, text, vorher)
+        print(f"Sicherung: {s}")
 
 
-def aendere(v, name):
+def aendere(v, name, z=False, probe=False):
     p = finden(v, name)
-    roh = eingabe()
+    roh = eingabe(z)
     bloecke = re.findall(r"^@@@ alt\n(.*?)^@@@ neu\n(.*?)^@@@ ende\s*$", roh, flags=re.S | re.M)
     if not bloecke:
         fehler("keine Blöcke gefunden. Form: @@@ alt / Text / @@@ neu / Text / @@@ ende, je auf eigener Zeile")
     vorher = p.read_text(encoding="utf-8")
     text = vorher
+    fehlschlaege = []
     for i, (alt, neu_) in enumerate(bloecke, 1):
         alt, neu_ = alt.removesuffix("\n"), neu_.removesuffix("\n")
-        if not alt:
-            fehler(f"Block {i}: der alte Text ist leer, nichts geändert")
-        n = text.count(alt)
-        if n != 1:
-            anfang = alt.strip().splitlines()[0][:60] if alt.strip() else "(leer)"
-            fehler(f"Block {i}: alter Text kommt {n} Mal vor statt genau einmal, nichts geändert. Anfang: „{anfang}“")
-        text = text.replace(alt, neu_, 1)
-    s = sichern(p)
-    schreiben(p, text, vorher)
-    print(f"{len(bloecke)} Stelle(n) geändert. Sicherung: {s}")
+        anfang = alt.strip().splitlines()[0][:60] if alt.strip() else "(leer)"
+        n = text.count(alt) if alt else 0
+        if n == 1:
+            text = text.replace(alt, neu_, 1)
+            if z or probe:
+                print(f"Block {i}: passt. Anfang: „{anfang}“")
+        else:
+            grund = "der alte Text ist leer" if not alt else f"alter Text kommt {n} Mal vor statt genau einmal"
+            fehlschlaege.append(f"Block {i}: {grund}. Anfang: „{anfang}“")
+            if z or probe:
+                print(fehlschlaege[-1])
+    if fehlschlaege:
+        if z or probe:
+            fehler(f"{len(bloecke) - len(fehlschlaege)} von {len(bloecke)} Blöcken passen, nichts geändert")
+        fehler(fehlschlaege[0] + ", nichts geändert")
+    if z or probe:
+        print(f"{len(bloecke)} von {len(bloecke)} Blöcken passen genau einmal. "
+              f"Datei: {p.name}, {len(vorher.splitlines())} Zeilen, danach {len(text.splitlines())}.")
+    if bestaetigen(probe, z):
+        s = sichern(p)
+        schreiben(p, text, vorher)
+        print(f"{len(bloecke)} Stelle(n) geändert. Sicherung: {s}")
 
 
 def main():
@@ -250,6 +330,10 @@ def main():
         print(__doc__.strip())
         return
     befehl, rest = a[0], a[1:]
+    z = any(r in ("-z", "--zwischenablage") for r in rest)
+    probe = "--probe" in rest
+    if befehl in ("neu", "ersetze", "aendere"):
+        rest = [r for r in rest if r not in ("-z", "--zwischenablage", "--probe")]
     v = vault()
     if befehl == "liste" and len(rest) <= 1:
         liste(v, *rest)
@@ -258,11 +342,11 @@ def main():
     elif befehl == "zeige" and [r for r in rest if r != "--kopieren"]:
         zeige(v, [r for r in rest if r != "--kopieren"], "--kopieren" in rest)
     elif befehl == "neu" and len(rest) == 1:
-        neu(v, rest[0])
+        neu(v, rest[0], z, probe)
     elif befehl == "ersetze" and len(rest) == 1:
-        ersetze(v, rest[0])
+        ersetze(v, rest[0], z, probe)
     elif befehl == "aendere" and len(rest) == 1:
-        aendere(v, rest[0])
+        aendere(v, rest[0], z, probe)
     else:
         fehler("unbekannter Aufruf. Übersicht mit „notiz hilfe“")
 

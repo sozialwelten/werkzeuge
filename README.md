@@ -8,7 +8,7 @@ Kleine Kommandozeilenwerkzeuge für den Alltag unter Linux.
 | `trialog_abende` | Katalog je Trialog-Abend: ordnet Fotos aus dem Katalog von `bestand`, Abendordner, gescannte Blätter und Beiträge einer WordPress-Sicherung den Abenden zu und listet Tage mit vielen Fotos, die keinem Abend zugeordnet sind. Aufruf siehe unten | `python3` |
 | `obsidian_ordnen` | benennt und verschiebt Notizen eines Obsidian-Vaults nach einer Plan-Datei, zieht dabei alle Links nach, wandelt YAML-Köpfe in eine schlichte Zeile um und setzt Hashtags. Zeigt ohne `--ausfuehren` nur an, was geschehen würde, und legt vor dem Ausführen eine Sicherung an. Aufruf siehe unten | `python3` |
 | `kontoauswertung` | wertet CSV-Exporte eines Girokontos (Santander/Openbank) aus: erkennt wiederkehrende Zahlungen und zeigt jede im Monat ihrer tatsächlichen Fälligkeit, auch jährliche, rechnet den Kontostand für die kommenden Monate voraus und liefert Tilgungspläne, Kontoverlauf, Ausgaben je Kategorie und nicht zugeordnete Zahlungen. Persönliche Zuordnungen stehen in einer eigenen Regeldatei, ein Muster liegt als `regeln.beispiel.toml` bei. Aufruf siehe unten | `python3` ab 3.11 |
-| `notiz` | liest, legt an und ändert Notizen in einem Obsidian-Vault, Text über die Standardeingabe. Gedacht für die Arbeit mit einer Assistenz im Chat: Sie gibt fertige Befehle, der Mensch führt sie aus. `karte` zeigt alle Notizen mit Stand und erstem Satz, `zeige --kopieren` legt Notizen in die Zwischenablage. Vor jeder Änderung eine Sicherung. Aufruf siehe unten | `python3`, für `--kopieren` `wl-copy` (Paket `wl-clipboard`) oder `xclip` |
+| `notiz` | liest, legt an und ändert Notizen in einem Obsidian-Vault, Text aus der Zwischenablage oder über die Standardeingabe. Gedacht für die Arbeit mit einer Assistenz im Chat: Sie gibt fertige Befehle, der Mensch führt sie aus. `karte` zeigt alle Notizen mit Stand und erstem Satz, `zeige --kopieren` legt Notizen in die Zwischenablage, `-z` liest neuen Text aus ihr und fragt nach einer Prüfung, ob geschrieben wird, `--probe` prüft nur. Vor jeder Änderung eine Sicherung. Aufruf siehe unten | `python3`, für die Zwischenablage `wl-copy` und `wl-paste` (Paket `wl-clipboard`), `xclip` oder `xsel` |
 | `cr2` | wandelt alle CR2-Rohdateien im aktuellen Ordner in JPEG um, vorhandene JPEGs bleiben unangetastet | `darktable-cli` (Paket `darktable`) |
 | `pdf_reduktion` | verkleinert eine PDF durch verlustbehaftete Neukomprimierung: `pdf_reduktion eingabe.pdf ausgabe.pdf [dpi]`, Standard 90 dpi | `gs` (Paket `ghostscript`) |
 
@@ -42,11 +42,22 @@ Liest alle CSV-Exporte im Ordner, auch überlappende, und schreibt einen Markdow
     notiz liste [ORDNER]
     notiz karte [ORDNER]
     notiz zeige NAME [NAME …] [--kopieren]
-    notiz neu ORDNER/NAME  < text.md
-    notiz ersetze NAME     < text.md
-    notiz aendere NAME     < blöcke.txt
+    notiz neu ORDNER/NAME  [-z] [--probe]  < text.md
+    notiz ersetze NAME     [-z] [--probe]  < text.md
+    notiz aendere NAME     [-z] [--probe]  < blöcke.txt
 
 Den Vault nennt die Umgebungsvariable `OBSIDIAN_VAULT`. `neu` legt keine Ordner an und lehnt vergebene Namen ab. `aendere` liest Blöcke aus `@@@ alt`, altem Text, `@@@ neu`, neuem Text und `@@@ ende`. Jeder alte Text muss genau einmal vorkommen, sonst ändert sich nichts. Sicherungen liegen unter `~/.local/state/notiz/`.
+
+Mit `-z` (`--zwischenablage`) kommt der Text aus der Zwischenablage statt aus der Standardeingabe. So bleibt langer Inhalt aus dem Terminal heraus, in dem Bash beim Einfügen vieler Zeilen die Anzeige durcheinanderbringt. Die Reihenfolge ist wichtig, weil das Kopieren des Befehls die Zwischenablage überschreibt:
+
+1. Den kurzen Befehl kopieren und starten, etwa `notiz aendere "Finanzen" -z`.
+2. `notiz` wartet. Jetzt den Inhalt kopieren und Enter drücken. Steht noch der Befehl in der Zwischenablage, sagt `notiz` das und wartet weiter.
+3. `notiz` prüft und zeigt eine Übersicht: bei `aendere` für jeden Block, ob er genau einmal passt, bei `neu` und `ersetze` Ziel, Zeilenzahl, erste und letzte Zeile und die Hinweise zu YAML-Kopf, Überschrift, Stand-Zeile und Hashtags.
+4. `notiz` fragt `Schreiben? [j/N]`. Nur `j` schreibt.
+
+Passt bei `aendere` ein Block nicht, nennt `notiz` alle fehlerhaften Blöcke und schreibt nichts.
+
+`--probe` macht dieselbe Prüfung und schreibt nie, mit der Standardeingabe wie mit `-z`. Damit lassen sich vorbereitete Änderungen testen, etwa von einer Assistenz, die die Datei nicht vorher gesehen hat.
 
 ## aliase
 
