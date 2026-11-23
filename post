@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""post: Thunderbirds lokale Mailablage durchsuchen und Entwürfe von der Konsole öffnen.
+
+Unterbefehle:
+  post suche [BEGRIFF ...] [--von X] [--an X] [--betreff X] [--text X]
+             [--ordner X] [--seit TT.MM.JJJJ] [--bis TT.MM.JJJJ] [-n 20]
+  post zeige ID [--kopieren]
+  post anhaenge ID [--ziel ORDNER]
+  post eml ID [--ziel ORDNER]
+  post ordner
+  post entwurf --an ADRESSE [--cc ADRESSE] --betreff TEXT [--anhang PFAD ...]
+               (-z | --text DATEI)
+
+Nur Python-Standardbibliothek. Liest die mbox-Dateien von Thunderbird,
+schreibt nie hinein.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import email
+import email.header
+import email.policy
+import email.utils
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from email.parser import BytesHeaderParser
+
+HOME = os.path.expanduser("~")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "post")
+CACHE_FILE = os.path.join(CACHE_DIR, "index.json")
+CACHE_VERSION = 2
+DOWNLOADS = os.path.join(HOME, "Downloads")
+
+# Flag in X-Mozilla-Status: Nachricht gelöscht, aber Ordner noch nicht komprimiert
+MSG_FLAG_EXPUNGED = 0x0008
+
+
+# ---------------------------------------------------------------- Profil
+
+def profil_kandidaten():
+    muster = [
+        os.path.join(HOME, "snap/thunderbird/current/.config/thunderbird/*"),
+        os.path.join(HOME, "snap/thunderbird/current/.thunderbird/*"),
+        os.path.join(HOME, ".thunderbird/*"),
+        os.path.join(HOME, ".var/app/org.mozilla.Thunderbird/.thunderbird/*"),
+    ]
+    env = os.environ.get("POST_PROFIL")
+    if env:
+        return [env]
+    treffer = []
+    for m in muster:
+        for p in sorted(glob.glob(m)):
+            if os.path.isfile(os.path.join(p, "prefs.js")):
+                treffer.append(p)
+    return treffer
+
+
+def profil():
+    kandidaten = profil_kandidaten()
+    if not kandidaten:
+        sys.exit("Kein Thunderbird-Profil gefunden. Pfad mit POST_PROFIL=... angeben.")
+    # das mit der jüngsten prefs.js ist das benutzte
+    return max(kandidaten, key=lambda p: os.path.getmtime(os.path.join(p, "prefs.js")))
+
+
+def konten_namen(prof):
+    """Ordnet Serververzeichnisse dem Kontonamen aus prefs.js zu."""
+    namen, verz = {}, {}
+    try:
+        with open(os.path.join(prof, "prefs.js"), encoding="utf-8", errors="replace") as f:
+            for zeile in f:
+                m = re.match(r'user_pref\("mail\.server\.(server\d+)\.(name|directory-rel)",\s*"(.*)"\);', zeile)
+                if m:
+                    server, schluessel, wert = m.groups()
+                    if schluessel == "name":
+                        namen[server] = wert
+                    else:
+                        verz[server] = wert.replace("[ProfD]", "")
+    except OSError:
+        pass
+    return {verz[s]: namen.get(s, verz[s]) for s in verz}
+
+
+def mutf7_dekodieren(name):
+    """IMAP-Ordnernamen (modifiziertes UTF-7) lesbar machen, z. B. Entw&APw-rfe."""
+    def ersetzen(m):
+        teil = m.group(1)
+        if teil == "":
+            return "&"
+        b = teil.replace(",", "/")
+        b += "=" * (-len(b) % 4)
+        try:
+            return base64.b64decode(b).decode("utf-16-be")
+        except Exception:
+            return m.group(0)
+    return re.sub(r"&([^-]*)-", ersetzen, name)
+
+
+def mbox_dateien(prof):
+    """Liefert (pfad, anzeigename) für alle mbox-Dateien."""
+    konten = konten_namen(prof)
+    ergebnis = []
+    for wurzel in ("ImapMail", "Mail"):
+        basis = os.path.join(prof, wurzel)
+        if not os.path.isdir(basis):
+            continue
+        for dirpath, _dirs, files in os.walk(basis):
+            for fn in files:
+                if fn.endswith((".msf", ".dat", ".html", ".json", ".sqlite")) or fn.startswith("."):
+                    continue
+                pfad = os.path.join(dirpath, fn)
+                rel = os.path.relpath(pfad, prof)
+                teile = rel.split(os.sep)
+                konto_rel = os.path.join(teile[0], teile[1]) if len(teile) > 2 else rel
+                konto = konten.get(konto_rel, teile[1] if len(teile) > 1 else rel)
+                ordner = "/".join(mutf7_dekodieren(t[:-4] if t.endswith(".sbd") else t) for t in teile[2:])
+                ergebnis.append((pfad, f"{konto}/{ordner}"))
+    return ergebnis
+
+
+# ---------------------------------------------------------------- Index
+
+def dekodiere(wert):
+    if wert is None:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(str(wert))))
+    except Exception:
+        return str(wert)
+
+
+def datum_iso(wert):
+    try:
+        d = email.utils.parsedate_to_datetime(wert)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone().isoformat(timespec="minutes")
+    except Exception:
+        return ""
+
+
+def nachrichten_scannen(pfad, start=0):
+    """Zerlegt eine mbox ab Byte-Position start in (offset, laenge, kopfdaten)."""
+    parser = BytesHeaderParser()
+    eintraege = []
+    with open(pfad, "rb") as f:
+        f.seek(start)
+        pos = start
+        aktuell = None
+        vorher_leer = True
+        kopf, im_kopf = [], False
+        for zeile in f:
+            if zeile.startswith(b"From ") and vorher_leer:
+                if aktuell is not None:
+                    eintraege.append((aktuell, pos - aktuell, b"".join(kopf)))
+                aktuell, kopf, im_kopf = pos, [], True
+            elif im_kopf:
+                if zeile in (b"\n", b"\r\n"):
+                    im_kopf = False
+                else:
+                    kopf.append(zeile)
+            vorher_leer = zeile in (b"\n", b"\r\n")
+            pos += len(zeile)
+        if aktuell is not None:
+            eintraege.append((aktuell, pos - aktuell, b"".join(kopf)))
+    ergebnis = []
+    for offset, laenge, rohkopf in eintraege:
+        k = parser.parsebytes(rohkopf)
+        status = k.get("X-Mozilla-Status", "0")
+        try:
+            if int(status, 16) & MSG_FLAG_EXPUNGED:
+                continue
+        except ValueError:
+            pass
+        ergebnis.append({
+            "o": offset, "l": laenge,
+            "d": datum_iso(k.get("Date")),
+            "von": dekodiere(k.get("From")),
+            "an": dekodiere(k.get("To")),
+            "cc": dekodiere(k.get("Cc")),
+            "betreff": dekodiere(k.get("Subject")).replace("\n", " "),
+            "mid": (k.get("Message-ID") or "").strip(),
+        })
+    return ergebnis
+
+
+def beginnt_mit_from(pfad, offset):
+    try:
+        with open(pfad, "rb") as f:
+            f.seek(offset)
+            return f.read(5) == b"From "
+    except OSError:
+        return False
+
+
+def index_laden():
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            daten = json.load(f)
+        if daten.get("version") == CACHE_VERSION:
+            return daten
+    except (OSError, ValueError):
+        pass
+    return {"version": CACHE_VERSION, "dateien": {}}
+
+
+def index_aktualisieren():
+    prof = profil()
+    daten = index_laden()
+    alt = daten["dateien"]
+    neu = {}
+    for pfad, name in mbox_dateien(prof):
+        st = os.stat(pfad)
+        e = alt.get(pfad)
+        if e and e["size"] == st.st_size and e["mtime"] == st.st_mtime:
+            e["name"] = name
+            neu[pfad] = e
+            continue
+        if e and st.st_size > e["size"] and beginnt_mit_from(pfad, e["size"]):
+            print(f"  aktualisiere {name} …", file=sys.stderr)
+            msgs = e["msgs"] + nachrichten_scannen(pfad, e["size"])
+        else:
+            if st.st_size > 5_000_000:
+                print(f"  lese {name} ({st.st_size // 1_000_000} MB) …", file=sys.stderr)
+            msgs = nachrichten_scannen(pfad) if st.st_size else []
+        neu[pfad] = {"size": st.st_size, "mtime": st.st_mtime, "name": name, "msgs": msgs}
+    daten["dateien"] = neu
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(daten, f, ensure_ascii=False)
+    os.replace(tmp, CACHE_FILE)
+    return daten
+
+
+def kurz_id(pfad, msg):
+    grund = (msg["mid"] or f"{msg['o']}") + "|" + pfad
+    return hashlib.sha1(grund.encode("utf-8", "replace")).hexdigest()[:6]
+
+
+def alle_nachrichten(daten):
+    for pfad, e in daten["dateien"].items():
+        for m in e["msgs"]:
+            yield pfad, e["name"], m
+
+
+def finde(daten, mid):
+    for pfad, name, m in alle_nachrichten(daten):
+        if kurz_id(pfad, m) == mid:
+            return pfad, name, m
+    sys.exit(f"Keine Mail mit ID {mid} gefunden. Erst mit 'post suche' suchen.")
+
+
+def roh_lesen(pfad, m):
+    with open(pfad, "rb") as f:
+        f.seek(m["o"])
+        roh = f.read(m["l"])
+    # erste Zeile ("From - ...") ist mbox-Trenner, nicht Teil der Mail
+    nl = roh.find(b"\n")
+    roh = roh[nl + 1:] if roh.startswith(b"From ") else roh
+    # mbox-Maskierung zurücknehmen
+    return re.sub(rb"(?m)^>(>*From )", rb"\1", roh)
+
+
+def mail_objekt(pfad, m):
+    return email.message_from_bytes(roh_lesen(pfad, m), policy=email.policy.default)
+
+
+# ---------------------------------------------------------------- Text
+
+def html_zu_text(h):
+    h = re.sub(r"(?is)<(script|style).*?</\1>", "", h)
+    h = re.sub(r"(?i)<br\s*/?>", "\n", h)
+    h = re.sub(r"(?i)</(p|div|tr|li|h\d)>", "\n", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    h = html.unescape(h)
+    h = re.sub(r"[ \t]+", " ", h)
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", h).strip()
+
+
+def text_von(msg):
+    teil = msg.get_body(preferencelist=("plain", "html"))
+    if teil is None:
+        return ""
+    try:
+        inhalt = teil.get_content()
+    except Exception:
+        inhalt = teil.get_payload(decode=True).decode("utf-8", "replace")
+    if teil.get_content_type() == "text/html":
+        inhalt = html_zu_text(inhalt)
+    return inhalt.strip()
+
+
+def anhaenge_von(msg):
+    return [t for t in msg.iter_attachments() if t.get_filename()]
+
+
+# ---------------------------------------------------------------- Befehle
+
+def datum_param(s):
+    try:
+        return dt.datetime.strptime(s, "%d.%m.%Y").date()
+    except ValueError:
+        sys.exit(f"Datum bitte als TT.MM.JJJJ, nicht {s}")
+
+
+def anzeige_datum(iso):
+    if not iso:
+        return "          "
+    try:
+        return dt.datetime.fromisoformat(iso).strftime("%d.%m.%Y")
+    except ValueError:
+        return iso[:10]
+
+
+def name_kurz(adresse):
+    name, addr = email.utils.parseaddr(adresse)
+    return (name or addr or adresse)[:24]
+
+
+def cmd_suche(a):
+    daten = index_aktualisieren()
+    begriffe = [b.lower() for b in a.begriffe]
+    seit = datum_param(a.seit) if a.seit else None
+    bis = datum_param(a.bis) if a.bis else None
+    treffer = []
+    for pfad, name, m in alle_nachrichten(daten):
+        if a.ordner and a.ordner.lower() not in name.lower():
+            continue
+        if a.von and a.von.lower() not in m["von"].lower():
+            continue
+        if a.an and a.an.lower() not in (m["an"] + " " + m["cc"]).lower():
+            continue
+        if a.betreff and a.betreff.lower() not in m["betreff"].lower():
+            continue
+        if seit or bis:
+            if not m["d"]:
+                continue
+            d = dt.datetime.fromisoformat(m["d"]).date()
+            if (seit and d < seit) or (bis and d > bis):
+                continue
+        kopf = " ".join((m["von"], m["an"], m["cc"], m["betreff"])).lower()
+        if begriffe and not all(b in kopf for b in begriffe):
+            continue
+        treffer.append((pfad, name, m))
+    if a.text:
+        such = a.text.lower()
+        gefiltert = []
+        for pfad, name, m in treffer:
+            try:
+                if such in text_von(mail_objekt(pfad, m)).lower():
+                    gefiltert.append((pfad, name, m))
+            except Exception:
+                continue
+        treffer = gefiltert
+    treffer.sort(key=lambda t: t[2]["d"] or "", reverse=True)
+    if not treffer:
+        print("Keine Treffer.")
+        return
+    gesehen = set()
+    gezeigt = 0
+    for pfad, name, m in treffer:
+        mid = kurz_id(pfad, m)
+        if mid in gesehen:
+            continue
+        gesehen.add(mid)
+        gesendet = re.search(r"/(Sent|Gesendet)", name)
+        wer = ("an " + name_kurz(m["an"])) if gesendet else name_kurz(m["von"])
+        print(f"{mid}  {anzeige_datum(m['d'])}  {wer:<27.27}  {m['betreff'][:60]:<60.60}  {name}")
+        gezeigt += 1
+        if gezeigt >= a.n:
+            break
+    if len(treffer) > gezeigt:
+        print(f"… {len(treffer)} Treffer insgesamt, die neuesten {gezeigt} gezeigt (mehr mit -n).")
+
+
+def cmd_zeige(a):
+    daten = index_aktualisieren()
+    pfad, name, m = finde(daten, a.id)
+    msg = mail_objekt(pfad, m)
+    anh = anhaenge_von(msg)
+    zeilen = [
+        f"==== Mail {a.id} ====",
+        f"Ordner:  {name}",
+        f"Datum:   {anzeige_datum(m['d'])} {m['d'][11:16] if m['d'] else ''}",
+        f"Von:     {m['von']}",
+        f"An:      {m['an']}",
+    ]
+    if m["cc"]:
+        zeilen.append(f"Cc:      {m['cc']}")
+    zeilen.append(f"Betreff: {m['betreff']}")
+    if anh:
+        zeilen.append("Anhänge: " + ", ".join(f"{t.get_filename()} ({len(t.get_payload(decode=True) or b'') // 1024} KB)" for t in anh))
+    zeilen += ["", text_von(msg)]
+    ausgabe = "\n".join(zeilen) + "\n"
+    if a.kopieren:
+        kopieren(ausgabe)
+        print(f"Mail {a.id} ({len(ausgabe)} Zeichen) in der Zwischenablage. Jetzt im Chat einfügen.")
+    else:
+        print(ausgabe)
+
+
+def freier_pfad(ziel, dateiname):
+    dateiname = os.path.basename(dateiname).replace("/", "_") or "anhang"
+    pfad = os.path.join(ziel, dateiname)
+    stamm, endung = os.path.splitext(pfad)
+    i = 1
+    while os.path.exists(pfad):
+        pfad = f"{stamm} ({i}){endung}"
+        i += 1
+    return pfad
+
+
+def cmd_anhaenge(a):
+    daten = index_aktualisieren()
+    pfad, _name, m = finde(daten, a.id)
+    anh = anhaenge_von(mail_objekt(pfad, m))
+    if not anh:
+        print("Diese Mail hat keine Anhänge.")
+        return
+    os.makedirs(a.ziel, exist_ok=True)
+    for t in anh:
+        ziel = freier_pfad(a.ziel, t.get_filename())
+        with open(ziel, "wb") as f:
+            f.write(t.get_payload(decode=True) or b"")
+        print(f"gespeichert: {ziel}")
+
+
+def cmd_eml(a):
+    daten = index_aktualisieren()
+    pfad, _name, m = finde(daten, a.id)
+    msg = mail_objekt(pfad, m)
+    betreff = re.sub(r"[^\w\-äöüÄÖÜß ]+", "_", m["betreff"])[:60].strip() or "mail"
+    os.makedirs(a.ziel, exist_ok=True)
+    ziel = freier_pfad(a.ziel, f"{anzeige_datum(m['d']).replace('.', '')}_{betreff}.eml")
+    with open(ziel, "wb") as f:
+        f.write(roh_lesen(pfad, m))
+    print(f"gespeichert: {ziel}")
+
+
+def cmd_ordner(_a):
+    daten = index_aktualisieren()
+    for pfad, e in sorted(daten["dateien"].items(), key=lambda x: x[1]["name"].lower()):
+        print(f"{len(e['msgs']):6}  {e['name']}")
+
+
+# ---------------------------------------------------------------- Entwurf
+
+def kopieren(text):
+    try:
+        subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=True)
+    except (OSError, subprocess.CalledProcessError):
+        sys.exit("wl-copy nicht verfügbar.")
+
+
+def einfuegen():
+    try:
+        return subprocess.run(["wl-paste", "--no-newline"], capture_output=True, check=True).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.CalledProcessError):
+        sys.exit("Zwischenablage leer oder wl-paste nicht verfügbar.")
+
+
+def ablage_fuer_thunderbird():
+    """Ordner, den auch ein Snap-Thunderbird lesen darf."""
+    snap = os.path.join(HOME, "snap/thunderbird/common")
+    basis = snap if os.path.isdir(snap) else CACHE_DIR
+    ziel = os.path.join(basis, "post-entwurf")
+    if os.path.isdir(ziel):
+        shutil.rmtree(ziel)
+    os.makedirs(ziel)
+    return ziel
+
+
+def cmd_entwurf(a):
+    for feld, wert in (("--an", a.an), ("--cc", a.cc or ""), ("--betreff", a.betreff)):
+        if "'" in wert:
+            sys.exit(f"{feld} darf kein Apostroph (') enthalten, das versteht Thunderbird nicht.")
+    fehlt = [p for p in a.anhang if not os.path.isfile(os.path.expanduser(p))]
+    if fehlt:
+        sys.exit("Anhang nicht gefunden:\n  " + "\n  ".join(fehlt))
+    if a.z:
+        input("Mailtext jetzt in die Zwischenablage kopieren, dann Enter (Abbruch mit Strg+C) ")
+        text = einfuegen()
+    elif a.text:
+        with open(a.text, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        sys.exit("Text fehlt: -z (Zwischenablage) oder --text DATEI angeben.")
+    text = text.strip("\n") + "\n"
+    if text.lstrip().startswith(("```", "~~~")):
+        sys.exit("Der kopierte Text beginnt mit einem Codeblock-Zeichen. Bitte nur den Mailtext kopieren.")
+
+    ablage = ablage_fuer_thunderbird()
+    textdatei = os.path.join(ablage, "text.txt")
+    with open(textdatei, "w", encoding="utf-8") as f:
+        f.write(text)
+    # Anhänge in die Ablage kopieren: Snap darf dort lesen, Kommas im Namen stören nicht mehr
+    kopien = []
+    gesamt = 0
+    for p in a.anhang:
+        quelle = os.path.expanduser(p)
+        name = os.path.basename(quelle).replace(",", "_").replace("'", "_")
+        ziel = freier_pfad(ablage, name)
+        shutil.copy2(quelle, ziel)
+        kopien.append(ziel)
+        gesamt += os.path.getsize(ziel)
+
+    print(f"An:      {a.an}")
+    if a.cc:
+        print(f"Cc:      {a.cc}")
+    print(f"Betreff: {a.betreff}")
+    for p, k in zip(a.anhang, kopien):
+        print(f"Anhang:  {os.path.basename(p)} ({os.path.getsize(k) // 1024} KB)")
+    erste = [z for z in text.splitlines() if z.strip()][:2]
+    print("Text:    " + " / ".join(erste)[:100] + f" … ({len(text)} Zeichen)")
+    if gesamt > 15 * 1024 * 1024:
+        print(f"Achtung: Anhänge zusammen {gesamt // (1024 * 1024)} MB, manche Empfänger nehmen nur bis 15 MB an.")
+
+    felder = [f"to='{a.an}'", f"subject='{a.betreff}'", "format=text", f"message='{textdatei}'"]
+    if a.cc:
+        felder.insert(1, f"cc='{a.cc}'")
+    if kopien:
+        felder.append("attachment='" + ",".join(kopien) + "'")
+    subprocess.Popen(["thunderbird", "-compose", ",".join(felder)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    print("Entwurf in Thunderbird geöffnet. Prüfen und selbst absenden.")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="post", description="Thunderbird von der Konsole: suchen, zeigen, Anhänge holen, Entwürfe öffnen.")
+    sp = p.add_subparsers(dest="befehl", required=True)
+
+    s = sp.add_parser("suche", help="Mails suchen (Absender, Empfänger, Betreff; mit --text auch im Inhalt)")
+    s.add_argument("begriffe", nargs="*", help="Begriffe, die in Von, An oder Betreff vorkommen")
+    s.add_argument("--von")
+    s.add_argument("--an")
+    s.add_argument("--betreff")
+    s.add_argument("--text", help="im Mailtext suchen (langsamer)")
+    s.add_argument("--ordner", help="Teil des Ordnernamens, z. B. Gesendet oder Rechnungen")
+    s.add_argument("--seit", help="TT.MM.JJJJ")
+    s.add_argument("--bis", help="TT.MM.JJJJ")
+    s.add_argument("-n", type=int, default=20, help="höchstens so viele Treffer zeigen (20)")
+    s.set_defaults(f=cmd_suche)
+
+    z = sp.add_parser("zeige", help="Mail als Text zeigen")
+    z.add_argument("id")
+    z.add_argument("--kopieren", action="store_true", help="in die Zwischenablage statt auf den Bildschirm")
+    z.set_defaults(f=cmd_zeige)
+
+    an = sp.add_parser("anhaenge", help="Anhänge einer Mail speichern")
+    an.add_argument("id")
+    an.add_argument("--ziel", default=DOWNLOADS)
+    an.set_defaults(f=cmd_anhaenge)
+
+    em = sp.add_parser("eml", help="Mail als .eml-Datei speichern")
+    em.add_argument("id")
+    em.add_argument("--ziel", default=DOWNLOADS)
+    em.set_defaults(f=cmd_eml)
+
+    o = sp.add_parser("ordner", help="alle Ordner mit Anzahl der Mails")
+    o.set_defaults(f=cmd_ordner)
+
+    e = sp.add_parser("entwurf", help="Entwurf in Thunderbird öffnen")
+    e.add_argument("--an", required=True)
+    e.add_argument("--cc")
+    e.add_argument("--betreff", required=True)
+    e.add_argument("--anhang", action="append", default=[])
+    e.add_argument("-z", action="store_true", help="Mailtext aus der Zwischenablage")
+    e.add_argument("--text", help="Mailtext aus Datei")
+    e.set_defaults(f=cmd_entwurf)
+
+    a = p.parse_args()
+    try:
+        a.f(a)
+    except KeyboardInterrupt:
+        sys.exit("\nAbgebrochen.")
+
+
+if __name__ == "__main__":
+    main()

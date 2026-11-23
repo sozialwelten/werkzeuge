@@ -9,6 +9,7 @@ Kleine Kommandozeilenwerkzeuge für den Alltag unter Linux.
 | `obsidian_ordnen` | benennt und verschiebt Notizen eines Obsidian-Vaults nach einer Plan-Datei, zieht dabei alle Links nach, wandelt YAML-Köpfe in eine schlichte Zeile um und setzt Hashtags. Zeigt ohne `--ausfuehren` nur an, was geschehen würde, und legt vor dem Ausführen eine Sicherung an. Aufruf siehe unten | `python3` |
 | `kontoauswertung` | wertet CSV-Exporte eines Girokontos (Santander/Openbank) aus: erkennt wiederkehrende Zahlungen und zeigt jede im Monat ihrer tatsächlichen Fälligkeit, auch jährliche, rechnet den Kontostand für die kommenden Monate voraus und liefert Tilgungspläne, Kontoverlauf, Ausgaben je Kategorie und nicht zugeordnete Zahlungen. Persönliche Zuordnungen stehen in einer eigenen Regeldatei, ein Muster liegt als `regeln.beispiel.toml` bei. Aufruf siehe unten | `python3` ab 3.11 |
 | `notiz` | liest, legt an und ändert Notizen in einem Obsidian-Vault, Text aus der Zwischenablage oder über die Standardeingabe. Gedacht für die Arbeit mit einer Assistenz im Chat: Sie gibt fertige Befehle, der Mensch führt sie aus. `karte` zeigt alle Notizen mit Stand und erstem Satz, `zeige --kopieren` legt Notizen in die Zwischenablage, `-z` liest neuen Text aus ihr und fragt nach einer Prüfung, ob geschrieben wird, `--probe` prüft nur. Vor jeder Änderung eine Sicherung. Aufruf siehe unten | `python3`, für die Zwischenablage `wl-copy` und `wl-paste` (Paket `wl-clipboard`), `xclip` oder `xsel` |
+| `post` | durchsucht die lokale Mailablage von Thunderbird nach Absender, Empfänger, Betreff, Inhalt und Zeitraum, zeigt Mails als Text oder legt sie in die Zwischenablage, speichert Anhänge und .eml-Dateien und öffnet fertige Entwürfe mit Text aus der Zwischenablage und Anhängen. Liest nur, braucht keine Zugangsdaten, abgeschickt wird von Hand in Thunderbird. Aufruf siehe unten | `python3` ab 3.9, Thunderbird mit offline gespeicherten Mails, für die Zwischenablage `wl-copy` und `wl-paste` (Paket `wl-clipboard`) |
 | `cr2` | wandelt alle CR2-Rohdateien im aktuellen Ordner in JPEG um, vorhandene JPEGs bleiben unangetastet | `darktable-cli` (Paket `darktable`) |
 | `pdf_reduktion` | verkleinert eine PDF durch verlustbehaftete Neukomprimierung: `pdf_reduktion eingabe.pdf ausgabe.pdf [dpi]`, Standard 90 dpi | `gs` (Paket `ghostscript`) |
 
@@ -59,6 +60,23 @@ Passt bei `aendere` ein Block nicht, nennt `notiz` alle fehlerhaften Blöcke und
 
 `--probe` macht dieselbe Prüfung und schreibt nie, mit der Standardeingabe wie mit `-z`. Damit lassen sich vorbereitete Änderungen testen, etwa von einer Assistenz, die die Datei nicht vorher gesehen hat.
 
+## post
+
+    post ordner
+    post suche [BEGRIFF …] [--von X] [--an X] [--betreff X] [--text X] [--ordner X] [--seit TT.MM.JJJJ] [--bis TT.MM.JJJJ] [-n 20]
+    post zeige ID [--kopieren]
+    post anhaenge ID [--ziel ORDNER]
+    post eml ID [--ziel ORDNER]
+    post entwurf --an ADRESSE [--cc ADRESSE] --betreff TEXT [--anhang PFAD …] (-z | --text DATEI)
+
+Gedacht für die Arbeit mit einer Assistenz im Chat, wie `notiz`: Einzelne Mails lassen sich gezielt in die Zwischenablage legen, Entwürfe kommen als Text aus der Zwischenablage zurück. `post` liest die mbox-Dateien von Thunderbird nur und schreibt nie in das Profil. Gefunden werden Profile unter `~/snap/thunderbird/current`, `~/.thunderbird` und im Flatpak-Pfad, ein anderes setzt die Umgebungsvariable `POST_PROFIL`. Konten erscheinen mit ihrem Namen aus `prefs.js`, Ordnernamen in modifiziertem UTF-7 wie `Entw&APw-rfe` lesbar.
+
+Beim ersten Aufruf liest `post` alle Kopfzeilen und legt einen Index unter `~/.cache/post/index.json` an, bei rund einem Gigabyte Mails dauert das ein bis zwei Minuten. Danach liest es nur geänderte Ordner neu, bei neu angehängten Mails nur den neuen Teil. Gelöschte, aber noch nicht komprimierte Mails werden übersprungen.
+
+`suche` zeigt die neuesten Treffer zuerst, jede Mail mit einer sechsstelligen ID, die `zeige`, `anhaenge` und `eml` nehmen. Ohne Filter durchsucht `suche` Von, An, Cc und Betreff, `--text` zusätzlich den Inhalt, das ist langsamer.
+
+`entwurf -z` läuft wie bei `notiz`: erst den Befehl starten, dann den Mailtext kopieren und Enter drücken. `post` prüft, ob die Anhänge existieren, zeigt Empfänger, Betreff, Anhänge und den Anfang des Textes und öffnet den Entwurf in Thunderbird. Text und Kopien der Anhänge legt es dafür in `~/snap/thunderbird/common/post-entwurf` ab, weil ein Snap-Thunderbird weder `/tmp` noch versteckte Ordner lesen kann. Kommas in Dateinamen werden dabei ersetzt, weil Thunderbird sie als Trenner liest, Apostrophe in Betreff und Adressen lehnt `post` ab. Thunderbird startet im Hintergrund ohne Ausgabe, das Terminal bleibt frei.
+
 ## aliase
 
 Kleine Shell-Aliase, die auf allen Rechnern gelten sollen. Einbinden mit einer Zeile in `~/.bash_aliases`:
@@ -86,4 +104,4 @@ Neue Werkzeuge: Datei ohne Endung in diesen Ordner legen, mit `chmod +x` ausfüh
 ## Lizenz
 
 - `pdf_reduktion`: shrinkpdf von Alfred Klomp, angepasst von Vivek Gite, BSD-3-Clause (Lizenztext in der Datei)
-- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `notiz`, `cr2`, `einrichten`, `aliase`, `trialog_abende`: GPL-3.0-or-later, Lizenztext in `LICENSE`
+- `bestand`, `obsidian_ordnen`, `kontoauswertung`, `notiz`, `post`, `cr2`, `einrichten`, `aliase`, `trialog_abende`: GPL-3.0-or-later, Lizenztext in `LICENSE`
