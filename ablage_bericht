@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Was in einigen Ablageordnern liegt, als Notiz für einen Obsidian-Vault, mit Vergleich zum letzten Lauf.
+
+Gedacht für Rechner, auf denen mehrere Menschen oder Assistenzen Daten anlegen, verschieben
+und löschen. Eine Notiz beschreibt, wozu die Ordner da sind. Dieser Bericht zeigt, was
+tatsächlich da ist. Weichen beide voneinander ab, fällt es auf.
+
+  ablage_bericht --aus DATEI [Optionen] ORDNER [ORDNER …]
+
+Für jeden ORDNER listet der Bericht die oberste Ebene mit Größe und letzter Änderung, dazu
+Größe und freien Platz des Laufwerks. Den Stand merkt sich das Programm unter
+~/.local/state/ablage_bericht/. Beim nächsten Lauf steht oben, was neu ist, was verschwunden
+ist und was sich stark in der Größe verändert hat. Jede solche Änderung kommt außerdem in den
+Verlauf am Ende der Notiz, damit sie auch nach weiteren Läufen sichtbar bleibt.
+
+Optionen:
+  --aus DATEI          Markdown-Datei, die geschrieben wird. Der Ordner muss schon existieren.
+                       Die Datei wird bei jedem Lauf ganz ersetzt.
+  --name NAME          Name des Rechners für Text und Zustandsdatei (Vorgabe: Hostname)
+  --eingehaengt PFAD   Dieser ORDNER muss ein eingehängtes Laufwerk sein. Ist er es nicht,
+                       steht eine Warnung oben im Bericht und der Ordner wird nicht gelistet.
+                       Mehrfach möglich.
+  --verweis NOTIZ      Notiz im Vault, die beschreibt, wozu die Ordner da sind
+  --hashtags TEXT      letzte Zeile der Notiz (Vorgabe: "#Assistenz #Infrastruktur")
+  --probe              Bericht nur ausgeben, nichts schreiben und den Zustand nicht ändern
+
+Lizenz: GPL-3.0-or-later
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+AUSLASSEN = {"lost+found"}
+VERLAUF_HOECHSTENS = 60
+VERLAUF_IN_NOTIZ = 25
+GROESSE_SCHWELLE = 1_000_000_000  # ab 1 GB Unterschied gilt eine Größe als stark verändert
+GROESSE_ANTEIL = 0.25             # und mindestens ein Viertel mehr oder weniger
+
+
+def groesse_text(byte):
+    if byte is None:
+        return "?"
+    for grenze, einheit in ((1e12, "TB"), (1e9, "GB"), (1e6, "MB"), (1e3, "KB")):
+        if byte >= grenze:
+            return f"{byte / grenze:.1f} {einheit}".replace(".", ",")
+    return f"{byte} B"
+
+
+def ordner_groesse(pfad):
+    """Größe in Byte über du, weil das schneller ist als ein Durchlauf in Python. None bei Fehler."""
+    try:
+        ergebnis = subprocess.run(["du", "-sb", "--", str(pfad)], capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(ergebnis.stdout.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def erfasse(ordner):
+    """Einträge der obersten Ebene: Name -> {art, groesse, geaendert}."""
+    eintraege = {}
+    with os.scandir(ordner) as liste:
+        for e in sorted(liste, key=lambda x: x.name.lower()):
+            if e.name in AUSLASSEN:
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if e.is_symlink():
+                art, groesse = "verweis", None
+            elif e.is_dir(follow_symlinks=False):
+                art, groesse = "ordner", ordner_groesse(e.path)
+            else:
+                art, groesse = "datei", st.st_size
+            eintraege[e.name] = {"art": art, "groesse": groesse,
+                                 "geaendert": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="minutes")}
+    return eintraege
+
+
+def anzeigename(name, art):
+    return f"`{name}/`" if art == "ordner" else f"`{name}`"
+
+
+def vergleiche(alt, neu, ordner):
+    """Liste von Änderungen zwischen zwei Ständen eines Ordners."""
+    aenderungen = []
+    for name, e in neu.items():
+        if name not in alt:
+            aenderungen.append({"art": "neu", "ordner": ordner, "name": name, "eintrag": e["art"],
+                                "groesse": e["groesse"]})
+        else:
+            vorher, jetzt = alt[name].get("groesse"), e["groesse"]
+            if vorher is not None and jetzt is not None:
+                diff = jetzt - vorher
+                if abs(diff) >= GROESSE_SCHWELLE and abs(diff) >= GROESSE_ANTEIL * max(vorher, 1):
+                    aenderungen.append({"art": "größer" if diff > 0 else "kleiner", "ordner": ordner,
+                                        "name": name, "eintrag": e["art"], "groesse": jetzt, "vorher": vorher})
+    for name, e in alt.items():
+        if name not in neu:
+            aenderungen.append({"art": "verschwunden", "ordner": ordner, "name": name, "eintrag": e.get("art"),
+                                "groesse": e.get("groesse")})
+    return aenderungen
+
+
+def aenderung_text(a):
+    pfad = f"`{Path(a['ordner']) / a['name']}{'/' if a.get('eintrag') == 'ordner' else ''}`"
+    if a["art"] in ("größer", "kleiner"):
+        return f"{a['art']}: {pfad}, {groesse_text(a['vorher'])} → {groesse_text(a['groesse'])}"
+    return f"{a['art']}: {pfad} ({groesse_text(a['groesse'])})"
+
+
+def laufwerk(ordner):
+    try:
+        st = os.statvfs(ordner)
+    except OSError:
+        return None
+    return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+
+
+def main():
+    p = argparse.ArgumentParser(description="Bestand einiger Ablageordner als Obsidian-Notiz, mit Vergleich zum letzten Lauf.")
+    p.add_argument("ordner", nargs="+")
+    p.add_argument("--aus", required=True)
+    p.add_argument("--name", default=socket.gethostname())
+    p.add_argument("--eingehaengt", action="append", default=[])
+    p.add_argument("--verweis")
+    p.add_argument("--hashtags", default="#Assistenz #Infrastruktur")
+    p.add_argument("--probe", action="store_true")
+    args = p.parse_args()
+
+    aus = Path(args.aus).expanduser()
+    if not args.probe and not aus.parent.is_dir():
+        sys.exit(f"Ordner für --aus gibt es nicht: {aus.parent}")
+    zustand_pfad = Path.home() / ".local/state/ablage_bericht" / f"{args.name}.json"
+    try:
+        zustand = json.loads(zustand_pfad.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        zustand = {}
+    alt_staende = zustand.get("ordner", {})
+    verlauf = zustand.get("verlauf", [])
+
+    jetzt = datetime.now()
+    eingehaengt = {str(Path(x).expanduser().resolve()) for x in args.eingehaengt}
+    warnungen, abschnitte, aenderungen, neue_staende = [], [], [], {}
+    gesehene_laufwerke = set()
+
+    for roh in args.ordner:
+        ordner = str(Path(roh).expanduser().resolve())
+        if not os.path.isdir(ordner):
+            warnungen.append(f"`{ordner}` gibt es nicht.")
+            continue
+        if ordner in eingehaengt and not os.path.ismount(ordner):
+            warnungen.append(f"`{ordner}` ist nicht eingehängt. Inhalt nicht erfasst, Vergleich ausgesetzt.")
+            if ordner in alt_staende:
+                neue_staende[ordner] = alt_staende[ordner]  # alten Stand behalten, sonst gälte alles als verschwunden
+            continue
+        stand = erfasse(ordner)
+        neue_staende[ordner] = stand
+        if ordner in alt_staende:
+            aenderungen += vergleiche(alt_staende[ordner], stand, ordner)
+
+        zeilen = [f"## {ordner}", ""]
+        lw = laufwerk(ordner)
+        dev = os.stat(ordner).st_dev
+        if lw and dev not in gesehene_laufwerke:
+            gesehene_laufwerke.add(dev)
+            zeilen += [f"Laufwerk: {groesse_text(lw[0])}, davon {groesse_text(lw[1])} frei.", ""]
+        elif lw:
+            zeilen += ["Liegt auf einem Laufwerk, das oben schon aufgeführt ist.", ""]
+        if stand:
+            zeilen += ["| Eintrag | Größe | geändert |", "|---|---|---|"]
+            for name, e in stand.items():
+                geaendert = datetime.fromisoformat(e["geaendert"]).strftime("%d.%m.%Y")
+                zeilen.append(f"| {anzeigename(name, e['art'])} | {groesse_text(e['groesse'])} | {geaendert} |")
+        else:
+            zeilen.append("Leer.")
+        abschnitte.append("\n".join(zeilen))
+
+    for a in aenderungen:
+        verlauf.append({"zeit": jetzt.isoformat(timespec="minutes"), **a})
+    verlauf = verlauf[-VERLAUF_HOECHSTENS:]
+
+    letzter = zustand.get("zeit")
+    teile = []
+    teile.append(f"Stand: {jetzt:%d.%m.%Y, %H:%M} Uhr. Automatisch erzeugt von `ablage_bericht`: was auf {args.name} "
+                 f"in den Ablageordnern liegt, mit Größe und letzter Änderung, und was sich seit dem letzten Lauf "
+                 f"verändert hat. Die Notiz wird bei jedem Lauf ganz ersetzt, Änderungen von Hand gehen dabei verloren."
+                 + (f" Wozu die Ordner da sind, steht in [[{args.verweis}]]." if args.verweis else ""))
+    if warnungen:
+        teile.append("## Achtung\n\n" + "\n".join(f"- {w}" for w in warnungen))
+    if letzter:
+        kopf = f"## Seit dem letzten Lauf ({datetime.fromisoformat(letzter):%d.%m.%Y, %H:%M} Uhr)"
+        teile.append(kopf + "\n\n" + ("\n".join(f"- {aenderung_text(a)}" for a in aenderungen)
+                                      if aenderungen else "Nichts neu, nichts verschwunden."))
+    else:
+        teile.append("## Seit dem letzten Lauf\n\nErster Lauf, noch kein Vergleich.")
+    teile += abschnitte
+    if verlauf:
+        zeilen = ["## Verlauf", "", "Neue und verschwundene Einträge und starke Größenänderungen, die jüngsten zuerst.",
+                  "", "| Datum | Änderung |", "|---|---|"]
+        for v in reversed(verlauf[-VERLAUF_IN_NOTIZ:]):
+            zeilen.append(f"| {datetime.fromisoformat(v['zeit']):%d.%m.%Y} | {aenderung_text(v)} |")
+        teile.append("\n".join(zeilen))
+    teile.append(args.hashtags)
+    text = "\n\n".join(teile) + "\n"
+
+    if args.probe:
+        print(text)
+        return
+    tmp = aus.with_name(aus.name + ".teil")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(aus)
+    zustand_pfad.parent.mkdir(parents=True, exist_ok=True)
+    zustand_pfad.write_text(json.dumps({"zeit": jetzt.isoformat(timespec="minutes"), "ordner": neue_staende,
+                                        "verlauf": verlauf}, ensure_ascii=False, indent=1), encoding="utf-8")
+    zahl = f"{len(aenderungen)} Änderung(en) seit dem letzten Lauf" if letzter else "erster Lauf"
+    print(f"geschrieben: {aus} ({zahl}{', ' + str(len(warnungen)) + ' Warnung(en)' if warnungen else ''})")
+    for w in warnungen:
+        print(f"Achtung: {w}".replace("`", ""))
+
+
+if __name__ == "__main__":
+    main()

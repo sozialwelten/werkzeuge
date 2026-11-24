@@ -77,6 +77,16 @@ Beim ersten Aufruf liest `post` alle Kopfzeilen und legt einen Index unter `~/.c
 
 `entwurf -z` läuft wie bei `notiz`: erst den Befehl starten, dann den Mailtext kopieren und Enter drücken. `post` prüft, ob die Anhänge existieren, zeigt Empfänger, Betreff, Anhänge und den Anfang des Textes und öffnet den Entwurf in Thunderbird. Text und Kopien der Anhänge legt es dafür in `~/snap/thunderbird/common/post-entwurf` ab, weil ein Snap-Thunderbird weder `/tmp` noch versteckte Ordner lesen kann. Kommas in Dateinamen werden dabei ersetzt, weil Thunderbird sie als Trenner liest, Apostrophe in Betreff und Adressen lehnt `post` ab. Thunderbird startet im Hintergrund ohne Ausgabe, das Terminal bleibt frei.
 
+## ablage_bericht
+
+    ablage_bericht --aus DATEI [--name NAME] [--eingehaengt PFAD] [--verweis NOTIZ] [--probe] ORDNER [ORDNER …]
+
+Schreibt eine Obsidian-Notiz mit der obersten Ebene der angegebenen Ordner: je Eintrag Größe und letzte Änderung, dazu Größe und freier Platz des Laufwerks. Den Stand merkt sich das Programm unter `~/.local/state/ablage_bericht/`. Ab dem zweiten Lauf steht oben, was neu ist, was verschwunden ist und was um mindestens 1 GB und ein Viertel größer oder kleiner wurde. Jede dieser Änderungen kommt außerdem in einen Verlauf am Ende der Notiz, damit sie auch nach weiteren Läufen sichtbar bleibt.
+
+`--eingehaengt` markiert Ordner, die ein eingehängtes Laufwerk sein müssen. Fehlt das Laufwerk, steht oben eine Warnung, und der alte Stand bleibt für den Vergleich erhalten, statt dass alles als verschwunden gilt. `lost+found` wird ausgelassen, die Größen ermittelt `du`. Die Notiz wird bei jedem Lauf ganz ersetzt. `--probe` gibt den Bericht nur aus.
+
+Entstanden, nachdem auf einem Rechner Ordner gelöscht wurden, die eine Notiz danach noch als vorhanden beschrieb. Eine Notiz sagt, wozu die Ordner da sind, der Bericht zeigt, was tatsächlich da ist.
+
 ## aliase
 
 Kleine Shell-Aliase, die auf allen Rechnern gelten sollen. Einbinden mit einer Zeile in `~/.bash_aliases`:
