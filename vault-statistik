@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Wie groß ein Obsidian-Vault ist und wie er sich in den letzten Tagen verändert hat.
+
+Aufruf:
+  vault-statistik            Bestand heute und die letzten 14 Tage
+  vault-statistik --tage 30  längerer Rückblick
+  vault-statistik --verlauf  die gespeicherte Zeitreihe anzeigen
+
+Der Vault steht in der Umgebungsvariablen OBSIDIAN_VAULT, wie bei notiz.
+Gezählt werden alle .md-Dateien außer in .obsidian, .trash und .git.
+Normseiten sind 1.800 Zeichen einschließlich Leerzeichen.
+
+„Zuletzt geändert“ zählt Notizen, deren letzte Änderung auf den Tag fällt.
+„Änderungen über notiz“ zählt die Sicherungen, die notiz bei aendere und
+ersetze in ~/.local/state/notiz anlegt. Neu angelegte Notizen erzeugen dort
+keine Sicherung.
+
+Jeder Aufruf schreibt den Bestand des Tages in die Zeitreihe
+~/.local/state/vault-statistik.csv. Ein zweiter Aufruf am selben Tag
+ersetzt die Zeile dieses Tages. Die Zeitreihe gilt je Rechner.
+"""
+import argparse
+import collections
+import datetime as dt
+import os
+import re
+import sys
+
+AUSGESCHLOSSEN = {".obsidian", ".trash", ".git"}
+SICHERUNGEN = os.path.expanduser("~/.local/state/notiz")
+ZEITREIHE = os.path.expanduser("~/.local/state/vault-statistik.csv")
+KOPF = "datum,notizen,woerter,zeichen"
+NORMSEITE = 1800
+
+
+def zahl(n):
+    return f"{n:,}".replace(",", ".")
+
+
+def vault():
+    pfad = os.environ.get("OBSIDIAN_VAULT")
+    if not pfad:
+        sys.exit("OBSIDIAN_VAULT ist nicht gesetzt. Etwa in ~/.bash_aliases: export OBSIDIAN_VAULT=…")
+    pfad = os.path.expanduser(pfad)
+    if not os.path.isdir(pfad):
+        sys.exit(f"Vault nicht gefunden: {pfad}")
+    return pfad
+
+
+def notizen(v):
+    for wurzel, ordner, dateien in os.walk(v):
+        ordner[:] = [o for o in ordner if o not in AUSGESCHLOSSEN]
+        for d in dateien:
+            if d.endswith(".md"):
+                yield os.path.join(wurzel, d)
+
+
+def zeitreihe_lesen():
+    if not os.path.exists(ZEITREIHE):
+        return []
+    with open(ZEITREIHE, encoding="utf-8") as f:
+        return [z.rstrip("\n") for z in f if z.strip() and not z.startswith("datum,")]
+
+
+def zeitreihe_schreiben(heute, anzahl, woerter, zeichen):
+    zeilen = [z for z in zeitreihe_lesen() if not z.startswith(heute.isoformat())]
+    zeilen.append(f"{heute.isoformat()},{anzahl},{woerter},{zeichen}")
+    zeilen.sort()
+    os.makedirs(os.path.dirname(ZEITREIHE), exist_ok=True)
+    with open(ZEITREIHE, "w", encoding="utf-8") as f:
+        f.write(KOPF + "\n" + "\n".join(zeilen) + "\n")
+
+
+def verlauf_zeigen():
+    zeilen = zeitreihe_lesen()
+    if not zeilen:
+        print("Noch keine Zeitreihe vorhanden.")
+        return
+    print("Datum          Notizen      Wörter        Zeichen   Normseiten   Zuwachs Zeichen")
+    vorher = None
+    for z in zeilen:
+        datum, anzahl, woerter, zeichen = z.split(",")
+        anzahl, woerter, zeichen = int(anzahl), int(woerter), int(zeichen)
+        tag = dt.date.fromisoformat(datum).strftime("%a %d.%m.%Y")
+        zuwachs = "" if vorher is None else f"{zeichen - vorher:+,}".replace(",", ".")
+        print(f"{tag}  {anzahl:>7}  {zahl(woerter):>10}  {zahl(zeichen):>13}  {zahl(round(zeichen / NORMSEITE)):>11}   {zuwachs:>15}")
+        vorher = zeichen
+
+
+def main():
+    p = argparse.ArgumentParser(description="Größe und Veränderung eines Obsidian-Vaults.")
+    p.add_argument("--tage", type=int, default=14, help="Rückblick in Tagen (Vorgabe 14)")
+    p.add_argument("--verlauf", action="store_true", help="gespeicherte Zeitreihe anzeigen")
+    a = p.parse_args()
+
+    if a.verlauf:
+        verlauf_zeigen()
+        return
+
+    v = vault()
+    anzahl = woerter = zeichen = 0
+    geaendert = collections.Counter()
+    for pfad in notizen(v):
+        with open(pfad, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        anzahl += 1
+        woerter += len(text.split())
+        zeichen += len(text)
+        geaendert[dt.date.fromtimestamp(os.stat(pfad).st_mtime)] += 1
+
+    aenderungen = collections.Counter()
+    if os.path.isdir(SICHERUNGEN):
+        for name in os.listdir(SICHERUNGEN):
+            m = re.search(r"(\d{4}-\d{2}-\d{2})_\d{6}", name)
+            if m:
+                aenderungen[dt.date.fromisoformat(m.group(1))] += 1
+
+    heute = dt.date.today()
+    print(f"== Bestand {heute.strftime('%d.%m.%Y')} ==")
+    print(f"Notizen: {zahl(anzahl)}")
+    print(f"Wörter: {zahl(woerter)}")
+    print(f"Zeichen: {zahl(zeichen)}")
+    print(f"Normseiten ({zahl(NORMSEITE)} Zeichen): {zahl(round(zeichen / NORMSEITE))}")
+    print(f"\n== Letzte {a.tage} Tage ==")
+    print("Datum        zuletzt geändert   Änderungen über notiz")
+    for i in range(a.tage - 1, -1, -1):
+        d = heute - dt.timedelta(days=i)
+        print(f"{d.strftime('%a %d.%m.')}   {geaendert[d]:>5}              {aenderungen[d]:>5}")
+
+    zeitreihe_schreiben(heute, anzahl, woerter, zeichen)
+    print(f"\nZeitreihe: {ZEITREIHE}  (anzeigen mit vault-statistik --verlauf)")
+
+
+if __name__ == "__main__":
+    main()
